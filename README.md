@@ -1,4 +1,7 @@
 This project used publicly available single-cell RNAseq (scRNA-seq) from GEO accession GSE324208 (Clough et al., 2024; Denu et al., 2026) to investigate transcriptional heterogeneity and inferred cell-state changes in WDLPS and DDLPS, focusing on marker analysis, and tumour-stromal communication across the LPS subtypes.
+
 **References:**
+
 Clough, E., Barrett, T., Wilhite, S. E., Ledoux, P., Evangelista, C., Kim, I. F.,…Soboleva, A. (2024). NCBI GEO: archive for gene expression and epigenomics data sets: 23-year update. Nucleic Acids Res, 52(D1), D138-d144. https://doi.org/10.1093/nar/gkad965
+
 Denu, R. A., Kochat, V., Zheng, Z., Satpati, S., Truong, D. D., Arslan, E.,…Rai, K. (2026). Spatially-resolved single cell atlas of liposarcoma reveals lineage hierarchies, immune niches, and regulatory circuits. openRxiv. https://dx.doi.org/10.64898/2026.03.23.713651
