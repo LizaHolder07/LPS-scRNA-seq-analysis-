@@ -1,0 +1,1 @@
+This project used publicly available single-cell RNAseq (scRNA-seq) from GEO accession GSE324208 to investigate transcriptional heterogeneity and inferred cell-state changes in WDLPS and DDLPS, focusing on marker analysis, and tumour-stromal communication across the LPS subtypes.
