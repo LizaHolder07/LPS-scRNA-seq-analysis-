@@ -1,0 +1,2486 @@
+---
+title: "GSE324208 RNA-only scRNA-seq Bulk cohort analysis"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r install-packages, eval=FALSE}
+#----------------------------------
+# STEP 0: Install packages
+#----------------------------------
+
+# Install once on a new machine; skip during routine runs.
+
+cran_packages <- c(
+  "Seurat",
+  "SeuratObject",
+  "Matrix",
+  "hdf5r",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "purrr",
+  "readr",
+  "ggplot2",
+  "patchwork",
+  "future",
+  "harmony",
+  "ggalluvial",
+  "FNN",
+  "clustree"
+)
+
+bioconductor_packages <- c(
+  "SingleCellExperiment",
+  "SummarizedExperiment",
+  "S4Vectors",
+  "SingleR",
+  "celldex"
+)
+
+packages_installed <- rownames(installed.packages())
+
+cran_packages_to_install <- setdiff(cran_packages, packages_installed)
+if (length(cran_packages_to_install) > 0) {
+  install.packages(cran_packages_to_install)
+}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+bioconductor_packages_to_install <- setdiff(
+  bioconductor_packages,
+  rownames(installed.packages())
+)
+
+if (length(bioconductor_packages_to_install) > 0) {
+  BiocManager::install(
+    bioconductor_packages_to_install,
+    ask = FALSE,
+    update = FALSE
+  )
+}
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 1: Clear environment and set parameters
+#-----------------------------------------------
+
+rm(list = ls())
+gc()
+
+# Paths and output names
+project_name <- "GSE324208_scRNA_bulk_analysis"
+working_dir <- "/rds/projects/g/gendood-bioinfohub/Thesis_LH"
+out_dir <- "GSE324208_scRNA_bulk_analysis"
+
+# Literature-derived marker gene file
+marker_file <- "/rds/projects/g/gendood-bioinfohub/Thesis_LH/Marker_genes/Literature_Marker_Genes.csv"
+
+# QC and filtering parameters
+min_features_create <- 200
+min_cells_create <- 3
+min_features_qc <- 500
+max_percent_mt <- 20
+# Limit genes to keep object size manageable.
+top_expressed_genes <- 10000L
+n_hvgs <- 2000
+n_pcs <- 30
+cluster_resolution <- 0.5
+clustree_resolutions <- seq(0.1, 1.0, by = 0.1)
+future_global_max_size_gb <- 4
+
+# JackStraw parameters for PC selection.
+jackstraw_replicates <- 100L
+jackstraw_score_threshold <- 1e-5
+jackstraw_pc_fdr_threshold <- 0.05
+jackstraw_fallback_dims <- 1:10
+
+# Reuse marker files if already written
+reuse_completed_cluster_markers <- TRUE
+
+# SingleR reference
+hpca_reference_file <- file.path(
+  path.expand(working_dir),
+  "data",
+  "HPCA_reference.rds"
+)
+download_hpca_if_missing <- TRUE
+
+# Reproducibility
+set.seed(42)
+
+```
+
+```{r}
+#----------------------------------------
+# STEP 2: Load required libraries
+#----------------------------------------
+
+library(Seurat)
+library(SeuratObject)
+
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(S4Vectors)
+library(SingleR)
+
+library(Matrix)
+library(hdf5r)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(ggplot2)
+library(patchwork)
+library(future)
+library(clustree)
+
+# Optional packages
+if (requireNamespace("harmony", quietly = TRUE)) library(harmony)
+if (requireNamespace("ggalluvial", quietly = TRUE)) library(ggalluvial)
+if (requireNamespace("FNN", quietly = TRUE)) library(FNN)
+
+# Run future-enabled Seurat calls in-process on BEAR
+future::plan("sequential")
+options(future.globals.maxSize = future_global_max_size_gb * 1024^3)
+message(
+  "future backend: ",
+  class(future::plan())[1],
+  " (one in-process worker)"
+)
+message(
+  "future.globals.maxSize: ",
+  future_global_max_size_gb,
+  "GB"
+)
+
+# Set working directory
+setwd(working_dir)
+
+# Output folders
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+objects_dir <- file.path(out_dir, "objects")
+plots_dir <- file.path(out_dir, "plots")
+tables_dir <- file.path(out_dir, "tables")
+
+objects_raw_dir <- file.path(objects_dir, "01_raw_samples")
+objects_filtered_dir <- file.path(objects_dir, "02_filtered_samples")
+objects_integrated_dir <- file.path(objects_dir, "03_integrated")
+objects_final_dir <- file.path(objects_dir, "04_final")
+
+plots_qc_dir <- file.path(plots_dir, "01_qc")
+plots_clustering_dir <- file.path(plots_dir, "02_clustering")
+plots_integration_dir <- file.path(plots_dir, "03_integration")
+plots_annotation_dir <- file.path(plots_dir, "04_annotation")
+plots_final_dir <- file.path(plots_dir, "05_final")
+
+tables_metadata_dir <- file.path(tables_dir, "01_metadata")
+tables_markers_dir <- file.path(tables_dir, "02_markers")
+tables_markers_by_cluster_dir <- file.path(
+  tables_markers_dir,
+  "by_cluster"
+)
+tables_annotations_dir <- file.path(tables_dir, "03_annotations")
+
+output_directories <- c(
+  objects_raw_dir,
+  objects_filtered_dir,
+  objects_integrated_dir,
+  objects_final_dir,
+  plots_qc_dir,
+  plots_clustering_dir,
+  plots_integration_dir,
+  plots_annotation_dir,
+  plots_final_dir,
+  tables_metadata_dir,
+  tables_markers_dir,
+  tables_markers_by_cluster_dir,
+  tables_annotations_dir
+)
+
+invisible(
+  lapply(
+    output_directories,
+    dir.create,
+    showWarnings = FALSE,
+    recursive = TRUE
+  )
+)
+
+# Safer plotting on HPC
+options(bitmapType = "cairo")
+theme_set(theme_classic(base_size = 12))
+
+```
+
+
+```{r}
+#------------------------------------------
+# STEP 3: Identify GSE324208 H5 files
+#------------------------------------------
+
+h5_files <- list.files(
+  path = ".",
+  pattern = "filtered_feature_bc_matrix.*\\.h5$",
+  full.names = TRUE,
+  recursive = FALSE
+)
+
+cat("Number of H5 files found:", length(h5_files), "\n")
+print(basename(h5_files))
+
+dd_files <- h5_files[str_detect(basename(h5_files), regex("_DD_", ignore_case = TRUE))]
+wd_files <- h5_files[str_detect(basename(h5_files), regex("_WD_", ignore_case = TRUE))]
+
+dd_files <- sort(dd_files)
+wd_files <- sort(wd_files)
+
+selected_files <- c(dd_files, wd_files)
+
+cat("DDLPS files:", length(dd_files), "\n")
+cat("WDLPS files:", length(wd_files), "\n")
+cat("Selected files:", length(selected_files), "\n")
+
+stopifnot(length(dd_files) == 10)
+stopifnot(length(wd_files) == 11)
+stopifnot(length(selected_files) == 21)
+stopifnot(all(file.exists(selected_files)))
+
+```
+
+```{r}
+#------------------------------------------
+# STEP 4: Metadata helper functions
+#------------------------------------------
+
+get_sample_id <- function(file) {
+  basename(file) %>%
+    str_remove("_filtered_feature_bc_matrix.*\\.h5$")
+}
+
+get_condition <- function(file) {
+  filename <- basename(file)
+  
+  case_when(
+    str_detect(filename, regex("_DD_", ignore_case = TRUE)) ~ "DDLPS",
+    str_detect(filename, regex("_WD_", ignore_case = TRUE)) ~ "WDLPS",
+    TRUE ~ NA_character_
+  )
+}
+
+get_patient_id <- function(file) {
+  sample_id <- get_sample_id(file)
+  str_match(sample_id, "^GSM[0-9]+_([0-9]+)_")[, 2]
+}
+
+sample_metadata <- data.frame(
+  file = selected_files,
+  sample_id = sapply(selected_files, get_sample_id),
+  condition = sapply(selected_files, get_condition),
+  patient_id = sapply(selected_files, get_patient_id),
+  stringsAsFactors = FALSE
+)
+
+write_csv(
+  sample_metadata,
+  file.path(tables_metadata_dir, "sample_metadata.csv")
+)
+
+sample_metadata
+
+```
+
+```{r}
+#----------------------------------------------------
+# STEP 5: RNA-only reader for 10X multiome H5 files
+#----------------------------------------------------
+
+read_10x_h5_rna_only <- function(h5_file) {
+  
+  if (!file.exists(h5_file)) {
+    stop("File does not exist: ", h5_file)
+  }
+  
+  h5 <- H5File$new(h5_file, mode = "r")
+  on.exit(h5$close_all())
+  
+  mat_group <- h5[["matrix"]]
+  feat_group <- h5[["matrix/features"]]
+  
+  data <- mat_group[["data"]][]
+  indices <- mat_group[["indices"]][]
+  indptr <- mat_group[["indptr"]][]
+  barcodes <- mat_group[["barcodes"]][]
+  
+  feature_type <- feat_group[["feature_type"]][]
+  gene_names <- feat_group[["name"]][]
+  
+  rna_features <- which(feature_type == "Gene Expression")
+  
+  if (length(rna_features) == 0) {
+    stop("No Gene Expression features found in: ", h5_file)
+  }
+  
+  row_map <- rep(NA_integer_, length(feature_type))
+  row_map[rna_features] <- seq_along(rna_features) - 1L
+  
+  keep <- !is.na(row_map[indices + 1L])
+  
+  new_i <- row_map[indices[keep] + 1L]
+  new_x <- as.numeric(data[keep])
+  
+  n_cells <- length(barcodes)
+  counts_per_col <- integer(n_cells)
+  
+  for (j in seq_len(n_cells)) {
+    start <- indptr[j] + 1L
+    end <- indptr[j + 1L]
+    
+    if (end >= start) {
+      counts_per_col[j] <- sum(keep[start:end])
+    }
+  }
+  
+  new_p <- c(0L, cumsum(counts_per_col))
+  rna_gene_names <- make.unique(gene_names[rna_features])
+  
+  rna_mat <- new(
+    "dgCMatrix",
+    i = as.integer(new_i),
+    p = as.integer(new_p),
+    x = new_x,
+    Dim = as.integer(c(length(rna_features), n_cells)),
+    Dimnames = list(rna_gene_names, barcodes)
+  )
+  
+  return(rna_mat)
+}
+
+# File check 
+test_counts <- read_10x_h5_rna_only(selected_files[1])
+dim(test_counts)
+rm(test_counts)
+gc()
+
+```
+
+```{r}
+#-----------------------------------------------------
+# STEP 6: Create RNA-only Seurat objects per sample
+#-----------------------------------------------------
+
+create_rna_seurat_object <- function(file) {
+  
+  sample_id <- get_sample_id(file)
+  condition <- get_condition(file)
+  patient_id <- get_patient_id(file)
+  
+  message("Creating Seurat object for: ", sample_id)
+  
+  counts <- read_10x_h5_rna_only(file)
+  colnames(counts) <- paste(sample_id, colnames(counts), sep = "_")
+  
+  obj <- CreateSeuratObject(
+    counts = counts,
+    assay = "RNA",
+    project = sample_id,
+    min.cells = min_cells_create,
+    min.features = min_features_create
+  )
+  
+  obj$sample_id <- sample_id
+  obj$condition <- condition
+  obj$patient_id <- patient_id
+  
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+  
+  return(obj)
+}
+
+for (file in selected_files) {
+  
+  sample_id <- get_sample_id(file)
+  raw_path <- file.path(
+    objects_raw_dir,
+    paste0(sample_id, "_RNA_only_raw.rds")
+  )
+  
+  if (!file.exists(raw_path)) {
+    obj <- create_rna_seurat_object(file)
+    saveRDS(obj, raw_path)
+    rm(obj)
+    gc()
+  } else {
+    message("Raw object already exists, skipping: ", sample_id)
+  }
+}
+
+```
+
+```{r}
+#-----------------------------------------------
+# STEP 7: QC filtering one sample at a time
+#-----------------------------------------------
+
+sample_rds_files <- list.files(
+  objects_raw_dir,
+  pattern = "_RNA_only_raw\\.rds$",
+  full.names = TRUE
+)
+
+qc_filtering_summary <- data.frame()
+qc_before_plot_list <- list()
+qc_after_plot_list <- list()
+
+sample_qc_metrics <- function(
+  object,
+  stage
+) {
+  metadata <- object[[]]
+
+  metadata %>%
+    tibble::rownames_to_column("cell") %>%
+    transmute(
+      cell,
+      sample_id = as.character(sample_id),
+      condition = as.character(condition),
+      stage = stage,
+      nFeature_RNA,
+      nCount_RNA,
+      percent.mt
+    )
+}
+
+for (rds_file in sample_rds_files) {
+  
+  message("QC filtering: ", basename(rds_file))
+  
+  obj <- readRDS(rds_file)
+  
+  sample_id <- unique(obj$sample_id)
+  condition <- unique(obj$condition)
+  patient_id <- unique(obj$patient_id)
+  
+  cells_before <- ncol(obj)
+  
+  nf_upper <- quantile(obj$nFeature_RNA, 0.995, na.rm = TRUE)
+  nc_upper <- quantile(obj$nCount_RNA, 0.995, na.rm = TRUE)
+  
+  obj_filt <- subset(
+    obj,
+    subset =
+      nFeature_RNA >= min_features_qc &
+      nFeature_RNA <= nf_upper &
+      nCount_RNA <= nc_upper &
+      percent.mt <= max_percent_mt
+  )
+  
+  cells_after <- ncol(obj_filt)
+
+  qc_before_plot_list[[sample_id]] <- sample_qc_metrics(
+    obj,
+    "Before filtering"
+  )
+  qc_after_plot_list[[sample_id]] <- sample_qc_metrics(
+    obj_filt,
+    "After filtering"
+  )
+  
+  filtered_path <- file.path(
+    objects_filtered_dir,
+    paste0(sample_id, "_RNA_only_filtered.rds")
+  )
+  
+  saveRDS(obj_filt, filtered_path)
+  
+  qc_filtering_summary <- rbind(
+    qc_filtering_summary,
+    data.frame(
+      sample_id = sample_id,
+      condition = condition,
+      patient_id = patient_id,
+      cells_before = cells_before,
+      cells_after = cells_after,
+      cells_removed = cells_before - cells_after,
+      percent_removed = round(((cells_before - cells_after) / cells_before) * 100, 2),
+      median_nFeature_after = median(obj_filt$nFeature_RNA),
+      median_nCount_after = median(obj_filt$nCount_RNA),
+      median_percent_mt_after = median(obj_filt$percent.mt)
+    )
+  )
+  
+  rm(obj, obj_filt)
+  gc()
+}
+
+write_csv(
+  qc_filtering_summary,
+  file.path(tables_metadata_dir, "QC_filtering_summary.csv")
+)
+
+qc_before_plot_data <- bind_rows(qc_before_plot_list)
+qc_after_plot_data <- bind_rows(qc_after_plot_list)
+
+qc_plot_data <- bind_rows(
+  qc_before_plot_data,
+  qc_after_plot_data
+)
+
+write_csv(
+  qc_plot_data,
+  file.path(
+    tables_metadata_dir,
+    "QC_violin_all_cell_metrics.csv"
+  )
+)
+
+make_qc_violin <- function(data, plot_title) {
+  data %>%
+    mutate(
+      sample_id = factor(
+        sample_id,
+        levels = sample_metadata$sample_id
+      )
+    ) %>%
+    pivot_longer(
+      cols = c(nFeature_RNA, nCount_RNA, percent.mt),
+      names_to = "metric",
+      values_to = "value"
+    ) %>%
+    ggplot(
+      aes(
+        x = sample_id,
+        y = value,
+        fill = condition
+      )
+    ) +
+    geom_violin(
+      scale = "width",
+      trim = TRUE,
+      linewidth = 0.2
+    ) +
+    geom_boxplot(
+      width = 0.12,
+      outlier.shape = NA,
+      alpha = 0.6,
+      linewidth = 0.2
+    ) +
+    facet_wrap(
+      ~ metric,
+      scales = "free_y",
+      ncol = 1
+    ) +
+    coord_flip() +
+    labs(
+      title = plot_title,
+      x = "Sample",
+      y = NULL,
+      fill = "Condition"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(axis.text.y = element_text(size = 6))
+}
+
+p_qc_before <- make_qc_violin(
+  qc_before_plot_data,
+  "RNA quality metrics before filtering"
+)
+p_qc_after <- make_qc_violin(
+  qc_after_plot_data,
+  "RNA quality metrics after filtering"
+)
+
+ggsave(
+  filename = file.path(
+    plots_qc_dir,
+    "QC_violin_before_filtering.pdf"
+  ),
+  plot = p_qc_before,
+  width = 14,
+  height = 12
+)
+
+ggsave(
+  filename = file.path(
+    plots_qc_dir,
+    "QC_violin_after_filtering.pdf"
+  ),
+  plot = p_qc_after,
+  width = 14,
+  height = 12
+)
+
+rm(
+  qc_before_plot_list,
+  qc_after_plot_list,
+  qc_before_plot_data,
+  qc_after_plot_data,
+  qc_plot_data,
+  p_qc_before,
+  p_qc_after
+)
+gc()
+
+qc_filtering_summary
+
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 8: Build full filtered-cell naive cohort
+#-----------------------------------------------
+
+filtered_rds_files <- list.files(
+  objects_filtered_dir,
+  pattern = "_RNA_only_filtered\\.rds$",
+  full.names = TRUE
+)
+
+cat("Filtered sample objects:", length(filtered_rds_files), "\n")
+stopifnot(length(filtered_rds_files) == 21)
+
+get_counts_matrix <- function(obj) {
+  tryCatch(
+    GetAssayData(obj, assay = "RNA", layer = "counts"),
+    error = function(e) GetAssayData(obj, assay = "RNA", slot = "counts")
+  )
+}
+
+# Common genes across samples
+common_genes <- NULL
+
+for (file in filtered_rds_files) {
+  obj <- readRDS(file)
+  genes <- rownames(obj)
+  
+  if (is.null(common_genes)) {
+    common_genes <- genes
+  } else {
+    common_genes <- intersect(common_genes, genes)
+  }
+  
+  rm(obj, genes)
+  gc()
+}
+
+cat("Common genes:", length(common_genes), "\n")
+
+# Use all QC-filtered cells
+counts_list <- list()
+metadata_list <- list()
+
+for (file in filtered_rds_files) {
+  
+  obj <- readRDS(file)
+  
+  sample_id <- unique(obj$sample_id)
+  condition <- unique(obj$condition)
+  patient_id <- unique(obj$patient_id)
+  
+  counts <- get_counts_matrix(obj)
+  counts <- counts[common_genes, , drop = FALSE]
+  
+  # Step 6 already prefixes barcodes. Add prefixes only for legacy objects without them
+  sample_prefix <- paste0(sample_id, "_")
+  if (!all(startsWith(colnames(counts), sample_prefix))) {
+    colnames(counts) <- paste(sample_id, colnames(counts), sep = "_")
+  }
+  
+  md <- data.frame(
+    cell = colnames(counts),
+    sample_id = sample_id,
+    condition = condition,
+    patient_id = patient_id,
+    row.names = colnames(counts)
+  )
+  
+  counts_list[[sample_id]] <- counts
+  metadata_list[[sample_id]] <- md
+  
+  rm(obj, counts, md)
+  gc()
+}
+
+combined_counts <- do.call(cbind, counts_list)
+combined_metadata <- do.call(rbind, metadata_list)
+
+rownames(combined_metadata) <- combined_metadata$cell
+combined_metadata <- combined_metadata[colnames(combined_counts), ]
+
+stopifnot(all(colnames(combined_counts) == rownames(combined_metadata)))
+
+# Retain top expressed genes
+gene_totals <- Matrix::rowSums(combined_counts)
+
+top_genes <- names(
+  sort(gene_totals, decreasing = TRUE)
+)[1:min(top_expressed_genes, length(gene_totals))]
+
+combined_counts_small <- combined_counts[top_genes, , drop = FALSE]
+
+# Free large matrices before normalisation.
+rm(combined_counts, counts_list, metadata_list, gene_totals)
+gc()
+
+naive_seurat <- CreateSeuratObject(
+  counts = combined_counts_small,
+  assay = "RNA",
+  project = project_name,
+  meta.data = combined_metadata,
+  min.cells = min_cells_create,
+  min.features = 100
+)
+
+naive_seurat[["percent.mt"]] <- PercentageFeatureSet(naive_seurat, pattern = "^MT-")
+naive_seurat[["percent.ribo"]] <- PercentageFeatureSet(naive_seurat, pattern = "^RP[SL]")
+
+rm(combined_counts_small, combined_metadata)
+gc()
+
+saveRDS(
+  naive_seurat,
+  file.path(
+    objects_integrated_dir,
+    "GSE324208_naive_full_filtered_counts.rds"
+  )
+)
+
+print(naive_seurat)
+table(naive_seurat$condition)
+
+
+```
+
+```{r}
+#-----------------------------------------------
+# STEP 9: Naive analysis without integration
+#-----------------------------------------------
+
+naive_seurat <- NormalizeData(
+  naive_seurat,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = TRUE
+)
+
+naive_seurat <- FindVariableFeatures(
+  naive_seurat,
+  selection.method = "vst",
+  nfeatures = n_hvgs,
+  verbose = TRUE
+)
+
+hvg_use <- VariableFeatures(naive_seurat)
+
+naive_seurat <- ScaleData(
+  naive_seurat,
+  features = hvg_use,
+  verbose = TRUE
+)
+
+naive_seurat <- RunPCA(
+  naive_seurat,
+  features = hvg_use,
+  npcs = n_pcs,
+  verbose = TRUE
+)
+
+p_elbow <- ElbowPlot(
+  naive_seurat,
+  ndims = n_pcs,
+  reduction = "pca"
+)
+
+ggsave(
+  filename = file.path(
+    plots_clustering_dir,
+    "ElbowPlot_PCA_dimensions.pdf"
+  ),
+  plot = p_elbow,
+  width = 8,
+  height = 6
+)
+
+# Use JackStraw p-values to choose PCs for downstream steps.
+set.seed(42)
+naive_seurat <- JackStraw(
+  naive_seurat,
+  reduction = "pca",
+  dims = n_pcs,
+  num.replicate = jackstraw_replicates,
+  verbose = TRUE
+)
+
+naive_seurat <- ScoreJackStraw(
+  naive_seurat,
+  reduction = "pca",
+  dims = seq_len(n_pcs),
+  score.thresh = jackstraw_score_threshold
+)
+
+jackstraw_results <- as.data.frame(
+  JS(naive_seurat[["pca"]], slot = "overall")
+) %>%
+  transmute(
+    pc = as.integer(PC),
+    p_value = as.numeric(Score)
+  ) %>%
+  mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    significant = p_adj_BH < jackstraw_pc_fdr_threshold
+  )
+
+significant_pcs <- jackstraw_results$pc[jackstraw_results$significant]
+
+if (length(significant_pcs) < 2L) {
+  dims_use <- intersect(jackstraw_fallback_dims, seq_len(n_pcs))
+  warning(
+    "Fewer than two PCs met the JackStraw threshold; using fallback PCs: ",
+    paste(dims_use, collapse = ", ")
+  )
+} else {
+  dims_use <- significant_pcs
+}
+
+write_csv(
+  jackstraw_results,
+  file.path(tables_metadata_dir, "JackStraw_PC_significance.csv")
+)
+
+writeLines(
+  paste(dims_use, collapse = ","),
+  file.path(tables_metadata_dir, "PCs_used_for_downstream_analysis.txt")
+)
+
+p_jackstraw <- JackStrawPlot(
+  naive_seurat,
+  dims = seq_len(n_pcs),
+  reduction = "pca"
+)
+
+ggsave(
+  filename = file.path(
+    plots_clustering_dir,
+    "JackStraw_PC_significance.pdf"
+  ),
+  plot = p_jackstraw,
+  width = 12,
+  height = 9
+)
+
+message(
+  "PCs selected for downstream analysis: ",
+  paste(dims_use, collapse = ", ")
+)
+
+naive_seurat <- FindNeighbors(
+  naive_seurat,
+  dims = dims_use,
+  verbose = TRUE
+)
+
+# Scan clustering resolutions for clustree.
+naive_seurat <- FindClusters(
+  naive_seurat,
+  resolution = clustree_resolutions,
+  verbose = TRUE
+)
+
+p_clustree_naive <- clustree(
+  naive_seurat@meta.data,
+  prefix = "RNA_snn_res."
+) +
+  ggtitle("Naive cohort clustree after JackStraw-selected PCs")
+
+ggsave(
+  filename = file.path(
+    plots_clustering_dir,
+    "Clustree_naive_resolution_scan.pdf"
+  ),
+  plot = p_clustree_naive,
+  width = 12,
+  height = 9
+)
+
+write_csv(
+  data.frame(resolution_tested = clustree_resolutions),
+  file.path(tables_metadata_dir, "clustree_resolutions_tested.csv")
+)
+
+# Apply selected clustering resolution.
+naive_seurat <- FindClusters(
+  naive_seurat,
+  resolution = cluster_resolution,
+  verbose = TRUE
+)
+
+naive_seurat <- RunUMAP(
+  naive_seurat,
+  dims = dims_use,
+  reduction.name = "umap",
+  seed.use = 42,
+  verbose = TRUE
+)
+
+saveRDS(
+  naive_seurat,
+  file.path(
+    objects_integrated_dir,
+    "GSE324208_naive_full_filtered_clustered.rds"
+  )
+)
+
+p_naive_sample <- DimPlot(
+  naive_seurat,
+  reduction = "umap",
+  group.by = "sample_id",
+  pt.size = 0.5
+) + ggtitle("Naive cohort: sample ID")
+
+p_naive_condition <- DimPlot(
+  naive_seurat,
+  reduction = "umap",
+  group.by = "condition",
+  pt.size = 0.5
+) + ggtitle("Naive cohort: WDLPS vs DDLPS")
+
+p_naive_cluster <- DimPlot(
+  naive_seurat,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE,
+  pt.size = 0.5
+) + ggtitle("WDLPS and DDLPS Bulk Naive cohort: clusters")
+
+ggsave(
+  file.path(
+    plots_integration_dir,
+    "01_naive_sample_condition_clusters.pdf"
+  ),
+  (p_naive_sample | p_naive_condition) / p_naive_cluster,
+  width = 14,
+  height = 10
+)
+
+```
+
+```{r}
+#--------------------------------------------------------------------
+# STEP 10: Optional Harmony integration on full filtered-cell cohort
+#--------------------------------------------------------------------
+
+integrated_harmony <- NULL
+
+if (requireNamespace("harmony", quietly = TRUE)) {
+  
+  library(harmony)
+  
+  message("Running Harmony integration on the full filtered-cell cohort...")
+  
+  integrated_harmony <- naive_seurat
+  
+  # Correct Harmony argument names
+  integrated_harmony <- RunHarmony(
+    object = integrated_harmony,
+    group.by.vars = "sample_id",
+    reduction.use = "pca",
+    dims.use = dims_use,
+    reduction.save = "harmony"
+  )
+
+  # Harmony dimensions follow the selected PCA dimensions.
+  harmony_dims_use <- seq_along(dims_use)
+  
+  integrated_harmony <- FindNeighbors(
+    integrated_harmony,
+    reduction = "harmony",
+    dims = harmony_dims_use,
+    verbose = TRUE
+  )
+
+  # Repeat resolution scan on the Harmony graph.
+  integrated_harmony <- FindClusters(
+    integrated_harmony,
+    resolution = clustree_resolutions,
+    verbose = TRUE
+  )
+
+  p_clustree_harmony <- clustree(
+    integrated_harmony@meta.data,
+    prefix = "RNA_snn_res."
+  ) +
+    ggtitle("Harmony cohort clustree after JackStraw-selected PCs")
+
+  ggsave(
+    filename = file.path(
+      plots_clustering_dir,
+      "Clustree_harmony_resolution_scan.pdf"
+    ),
+    plot = p_clustree_harmony,
+    width = 12,
+    height = 9
+  )
+  
+  # Apply selected Harmony resolution.
+  integrated_harmony <- FindClusters(
+    integrated_harmony,
+    resolution = cluster_resolution,
+    verbose = TRUE
+  )
+  
+  integrated_harmony <- RunUMAP(
+    integrated_harmony,
+    reduction = "harmony",
+    dims = harmony_dims_use,
+    reduction.name = "umap.harmony",
+    seed.use = 42,
+    verbose = TRUE
+  )
+  
+  saveRDS(
+    integrated_harmony,
+    file.path(
+      objects_integrated_dir,
+      "GSE324208_harmony_full_filtered_clustered.rds"
+    )
+  )
+  
+  p_harmony_sample <- DimPlot(
+    integrated_harmony,
+    reduction = "umap.harmony",
+    group.by = "sample_id",
+    pt.size = 0.5
+  ) + ggtitle("Harmony cohort: sample ID")
+  
+  p_harmony_condition <- DimPlot(
+    integrated_harmony,
+    reduction = "umap.harmony",
+    group.by = "condition",
+    pt.size = 0.5
+  ) + ggtitle("Harmony cohort: WDLPS vs DDLPS")
+  
+  p_harmony_cluster <- DimPlot(
+    integrated_harmony,
+    reduction = "umap.harmony",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 0.5
+  ) + ggtitle("WDLPS and DDLPS Bulk Harmony cohort: clusters")
+  
+  ggsave(
+    filename = file.path(
+      plots_integration_dir,
+      "02_harmony_sample_condition_clusters.pdf"
+    ),
+    plot = (p_harmony_sample | p_harmony_condition) / p_harmony_cluster,
+    width = 14,
+    height = 10
+  )
+  
+} else {
+  message("Harmony is not installed. Skipping optional Harmony comparison.")
+}
+
+```
+
+```{r}
+#------------------------------------------
+# STEP 11: Integration quality metrics
+#------------------------------------------
+
+calculate_mixing_metric <- function(seurat_obj, group_by = "sample_id", reduction = "umap", k = 50) {
+  
+  if (!requireNamespace("FNN", quietly = TRUE)) {
+    message("FNN is not installed. Returning NA for mixing metric.")
+    return(NA_real_)
+  }
+  
+  embedding <- Embeddings(seurat_obj, reduction = reduction)
+  k_use <- min(k, nrow(embedding) - 1)
+  
+  nn_result <- FNN::get.knn(embedding[, 1:2], k = k_use)
+  
+  group_labels <- seurat_obj@meta.data[[group_by]]
+  
+  mixing_scores <- sapply(1:nrow(nn_result$nn.index), function(i) {
+    neighbors <- nn_result$nn.index[i, ]
+    neighbor_groups <- group_labels[neighbors]
+    props <- table(neighbor_groups) / length(neighbor_groups)
+    1 / sum(props^2)
+  })
+  
+  mean(mixing_scores)
+}
+
+methods_list <- list(
+  Naive = list(obj = naive_seurat, reduction = "umap")
+)
+
+if (!is.null(integrated_harmony)) {
+  methods_list$Harmony <- list(obj = integrated_harmony, reduction = "umap.harmony")
+}
+
+mixing_results <- data.frame(
+  method = names(methods_list),
+  mixing_score = sapply(methods_list, function(x) {
+    calculate_mixing_metric(x$obj, group_by = "sample_id", reduction = x$reduction)
+  }),
+  n_clusters = sapply(methods_list, function(x) {
+    length(unique(x$obj$seurat_clusters))
+  })
+)
+
+write_csv(
+  mixing_results,
+  file.path(
+    tables_metadata_dir,
+    "integration_comparison_metrics.csv"
+  )
+)
+
+mixing_results
+
+# Choose final object
+# Use Harmony if it ran successfully; otherwise use the naive object.
+if (!is.null(integrated_harmony)) {
+  combined <- integrated_harmony
+  umap_reduction <- "umap.harmony"
+  integration_method_used <- "Harmony_full_filtered_cells"
+} else {
+  combined <- naive_seurat
+  umap_reduction <- "umap"
+  integration_method_used <- "Naive_full_filtered_cells"
+}
+
+integration_summary <- data.frame(
+  project_name = project_name,
+  n_samples = length(unique(combined$sample_id)),
+  n_cells_total = ncol(combined),
+  n_genes = nrow(combined),
+  integration_method_used = integration_method_used,
+  cell_downsampling = FALSE,
+  n_hvgs = n_hvgs,
+  n_pcs = n_pcs,
+  dims_used = paste(dims_use, collapse = ","),
+  jackstraw_pc_fdr_threshold = jackstraw_pc_fdr_threshold,
+  jackstraw_replicates = jackstraw_replicates,
+  cluster_resolution = cluster_resolution,
+  n_clusters = length(unique(combined$seurat_clusters))
+)
+
+write_csv(
+  integration_summary,
+  file.path(tables_metadata_dir, "integration_summary.csv")
+)
+
+saveRDS(
+  combined,
+  file.path(
+    objects_integrated_dir,
+    "GSE324208_selected_clustered_object.rds"
+  )
+)
+
+```
+
+```{r}
+
+#-----------------------------------------------
+# STEP 12: Find cluster-specific marker genes
+#-----------------------------------------------
+
+#  Marker tests use the sparse RNA assay against all other cells.
+cluster_ids <- sort(unique(as.character(combined$seurat_clusters)))
+all_cells <- colnames(combined)
+cluster_markers_list <- vector("list", length(cluster_ids))
+names(cluster_markers_list) <- cluster_ids
+
+for (i in seq_along(cluster_ids)) {
+  cluster_id <- cluster_ids[[i]]
+  safe_cluster_id <- str_replace_all(cluster_id, "[^A-Za-z0-9_-]", "_")
+  cluster_marker_file <- file.path(
+    tables_markers_by_cluster_dir,
+    paste0("cluster_", safe_cluster_id, "_markers.csv")
+  )
+
+  if (reuse_completed_cluster_markers && file.exists(cluster_marker_file)) {
+    message("Reusing marker table for cluster ", cluster_id)
+    cluster_markers_list[[i]] <- read_csv(
+      cluster_marker_file,
+      show_col_types = FALSE
+    )
+    next
+  }
+
+  message(
+    "Finding markers for cluster ",
+    cluster_id,
+    " (",
+    i,
+    "/",
+    length(cluster_ids),
+    ")"
+  )
+
+  target_pool <- all_cells[
+    as.character(combined$seurat_clusters) == cluster_id
+  ]
+  background_pool <- setdiff(all_cells, target_pool)
+
+  target_cells <- target_pool
+  background_cells <- background_pool
+
+  if (length(target_cells) < 3 || length(background_cells) < 3) {
+    warning("Skipping cluster ", cluster_id, ": too few cells.")
+    next
+  }
+
+  markers_i <- FindMarkers(
+    object = combined[["RNA"]],
+    cells.1 = target_cells,
+    cells.2 = background_cells,
+    only.pos = TRUE,
+    test.use = "wilcox",
+    min.pct = 0.25,
+    logfc.threshold = 0.25,
+    verbose = FALSE
+  )
+
+  if (nrow(markers_i) > 0) {
+    markers_i <- markers_i %>%
+      tibble::rownames_to_column("gene") %>%
+      mutate(
+        cluster = cluster_id,
+        n_target_tested = length(target_cells),
+        n_background_tested = length(background_cells)
+      ) %>%
+      filter(!grepl("^RP[SL]", gene)) %>%
+      filter(!grepl("^MT-", gene))
+
+    write_csv(markers_i, cluster_marker_file)
+    cluster_markers_list[[i]] <- markers_i
+  } else {
+    warning("No positive marker genes found for cluster ", cluster_id)
+  }
+
+  rm(
+    target_pool,
+    background_pool,
+    target_cells,
+    background_cells,
+    markers_i
+  )
+  gc()
+}
+
+cluster_markers_filtered <- bind_rows(cluster_markers_list)
+
+if (nrow(cluster_markers_filtered) == 0) {
+  stop("No cluster marker tables were produced.")
+}
+
+fold_change_column <- intersect(
+  c("avg_log2FC", "avg_logFC"),
+  colnames(cluster_markers_filtered)
+)[1]
+
+if (is.na(fold_change_column)) {
+  stop("No average log-fold-change column found in marker results.")
+}
+
+top5_markers <- cluster_markers_filtered %>%
+  group_by(cluster) %>%
+  slice_max(
+    order_by = .data[[fold_change_column]],
+    n = 5,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  arrange(cluster, desc(.data[[fold_change_column]]))
+
+write_csv(
+  cluster_markers_filtered,
+  file.path(tables_markers_dir, "cluster_markers_all_filtered.csv")
+)
+
+write_csv(
+  top5_markers,
+  file.path(tables_markers_dir, "top5_markers_per_cluster.csv")
+)
+
+# Heatmap is based on cluster averages
+heatmap_genes <- unique(top5_markers$gene)
+heatmap_genes <- heatmap_genes[heatmap_genes %in% rownames(combined)]
+
+log_data_heatmap <- tryCatch(
+  GetAssayData(combined, assay = "RNA", layer = "data"),
+  error = function(e) GetAssayData(combined, assay = "RNA", slot = "data")
+)
+
+cluster_factor_heatmap <- factor(
+  as.character(combined$seurat_clusters),
+  levels = cluster_ids
+)
+
+cluster_membership_heatmap <- Matrix::sparse.model.matrix(
+  ~ 0 + cluster_factor_heatmap
+)
+colnames(cluster_membership_heatmap) <- cluster_ids
+
+cluster_sizes_heatmap <- Matrix::colSums(cluster_membership_heatmap)
+cluster_sums_heatmap <- log_data_heatmap[
+  heatmap_genes,
+  ,
+  drop = FALSE
+] %*% cluster_membership_heatmap
+
+cluster_means_heatmap <- sweep(
+  as.matrix(cluster_sums_heatmap),
+  2,
+  cluster_sizes_heatmap,
+  "/"
+)
+
+cluster_z_heatmap <- t(scale(t(cluster_means_heatmap)))
+cluster_z_heatmap[!is.finite(cluster_z_heatmap)] <- 0
+
+heatmap_plot_data <- as.data.frame(
+  as.table(cluster_z_heatmap),
+  stringsAsFactors = FALSE
+) %>%
+  rename(
+    gene = Var1,
+    seurat_cluster = Var2,
+    scaled_average_expression = Freq
+  )
+
+p_top5_heatmap <- ggplot(
+  heatmap_plot_data,
+  aes(
+    x = seurat_cluster,
+    y = factor(gene, levels = rev(heatmap_genes)),
+    fill = scaled_average_expression
+  )
+) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0
+  ) +
+  labs(
+    title = "WDLPS and DDLPS Bulk cohort: top 5 markers per cluster",
+    subtitle = "Scaled cluster-average expression using every filtered cell",
+    x = "Seurat cluster",
+    y = "Gene",
+    fill = "Scaled average\nexpression"
+  ) +
+  theme_classic(base_size = 11)
+
+ggsave(
+  filename = file.path(
+    plots_clustering_dir,
+    "Heatmap_top5_markers_cluster_average.pdf"
+  ),
+  plot = p_top5_heatmap,
+  width = 14,
+  height = 12
+)
+
+top5_markers
+
+```
+
+```{r}
+#--------------------------------------
+# STEP 13: Load curated marker file
+#--------------------------------------
+
+marker_df <- read_csv(marker_file, show_col_types = FALSE)
+
+exact_marker_columns <- c(
+  "Fibroblasts",
+  "Myofibroblasts",
+  "Inflammatory_fibroblasts",
+  "ECM_remodelling_fibroblasts",
+  "Progenitor/Stem_like_fibroblasts",
+  "Perivascular_fibroblasts",
+  "Adipogenic_like_fibroblasts",
+  "Developmental/EMT_like_fibroblasts",
+  "Endothelial_cells",
+  "Capillary_endothelial_cells",
+  "Arterial_endothelial_cells",
+  "Venous_endothelial_cells",
+  "Lymphatic_endothelial_Cells",
+  "Tip_cells_endothelial",
+  "Endocardial_endothelial_cells",
+  "Pericytes",
+  "Smooth_muscle_cells",
+  "Chondrocytes",
+  "MSCs",
+  "T_cells",
+  "CD4_T_cells",
+  "CD8_T_cells",
+  "B_cells",
+  "NK_cells",
+  "Monocytes",
+  "Dendritic_cells",
+  "Neutrophils",
+  "Plasma_cells",
+  "Macrophages",
+  "M1_macrophages",
+  "M2_macrophages",
+  "Mast_cells",
+  "Osteoclasts",
+  "Adipocytes",
+  "Sarcoma",
+  "LPS_tumour_cells",
+  "LMS_tumour_cells",
+  "DDLPS",
+  "WDLPS",
+  "MLPS",
+  "PLPS",
+  "Ewing_tumour_cells",
+  "Osteosarcoma",
+  "Cancer_associated_fibroblasts"
+)
+
+present_marker_columns <- intersect(exact_marker_columns, colnames(marker_df))
+missing_marker_columns <- setdiff(exact_marker_columns, colnames(marker_df))
+
+cat("Marker columns present:", length(present_marker_columns), "\n")
+cat("Marker columns missing:", length(missing_marker_columns), "\n")
+print(missing_marker_columns)
+
+# Exclude WDLPS/DDLPS subtype markers from cell-identity labels
+condition_marker_columns <- intersect(
+  c("DDLPS", "WDLPS", "MLPS", "PLPS"),
+  present_marker_columns
+)
+annotation_marker_columns <- setdiff(
+  present_marker_columns,
+  condition_marker_columns
+)
+
+condition_marker_sets <- setNames(
+  lapply(condition_marker_columns, function(col) {
+    genes <- unique(na.omit(as.character(marker_df[[col]])))
+    genes[genes != ""]
+  }),
+  condition_marker_columns
+)
+
+if (all(c("WDLPS", "DDLPS") %in% names(condition_marker_sets))) {
+  wd_markers <- condition_marker_sets[["WDLPS"]]
+  dd_markers <- condition_marker_sets[["DDLPS"]]
+  shared_markers <- intersect(wd_markers, dd_markers)
+
+  condition_marker_overlap <- data.frame(
+    set_1 = "WDLPS",
+    set_2 = "DDLPS",
+    n_set_1 = length(wd_markers),
+    n_set_2 = length(dd_markers),
+    n_shared = length(shared_markers),
+    jaccard = length(shared_markers) / length(union(wd_markers, dd_markers)),
+    shared_genes = paste(shared_markers, collapse = ";")
+  )
+
+  write_csv(
+    condition_marker_overlap,
+    file.path(
+      tables_markers_dir,
+      "WDLPS_DDLPS_marker_overlap.csv"
+    )
+  )
+}
+
+get_marker_set <- function(marker_df, marker_columns, object = NULL) {
+  
+  genes <- marker_df %>%
+    select(any_of(marker_columns)) %>%
+    unlist(use.names = FALSE) %>%
+    as.character()
+  
+  genes <- genes[!is.na(genes)]
+  genes <- genes[genes != ""]
+  genes <- unique(genes)
+  
+  if (!is.null(object)) {
+    genes <- genes[genes %in% rownames(object)]
+  }
+  
+  return(genes)
+}
+
+marker_panel_exact <- setNames(
+  lapply(annotation_marker_columns, function(col) {
+    get_marker_set(marker_df, col, combined)
+  }),
+  annotation_marker_columns
+)
+
+marker_panel_exact_counts <- data.frame(
+  marker_column = names(marker_panel_exact),
+  n_markers_detected = sapply(marker_panel_exact, length)
+)
+
+write_csv(
+  marker_panel_exact_counts,
+  file.path(tables_markers_dir, "exact_marker_column_counts.csv")
+)
+
+marker_panel_exact_use <- marker_panel_exact[
+  sapply(marker_panel_exact, length) >= 2
+]
+
+marker_panel_exact_table <- stack(marker_panel_exact_use)
+colnames(marker_panel_exact_table) <- c("gene", "marker_column")
+
+write_csv(
+  marker_panel_exact_table,
+  file.path(tables_markers_dir, "exact_marker_column_used.csv")
+)
+
+```
+
+```{r}
+#------------------------------------------
+# STEP 14: Manual marker visualisation
+#------------------------------------------
+
+plot_markers_exact <- marker_panel_exact_use %>%
+  lapply(function(x) head(x, 5)) %>%
+  unlist(use.names = FALSE) %>%
+  unique()
+
+plot_markers_exact <- plot_markers_exact[
+  plot_markers_exact %in% rownames(combined)
+]
+
+p_dot_exact <- DotPlot(
+  combined,
+  features = plot_markers_exact,
+  group.by = "seurat_clusters"
+) +
+  RotatedAxis() +
+  ggtitle("Marker genes by Seurat cluster")
+
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "DotPlot_exact_marker_columns_by_cluster.pdf"
+  ),
+  plot = p_dot_exact,
+  width = 22,
+  height = 10
+)
+
+```
+
+
+```{r}
+#---------------------------------------------------
+# STEP 15: Independent manual cluster annotation
+#---------------------------------------------------
+
+# Manual labels use marker heatmaps and DotPlot.
+manual_cluster_labels <- setNames(
+  rep("Unresolved", length(cluster_ids)),
+  cluster_ids
+)
+
+# LPS tumour-like populations. These are provisional because CNV is needed to confirm malignant identity.
+manual_cluster_labels[c("10", "14")] <- "LPS_tumour_cells"
+manual_cluster_labels[c("3", "20")] <- "Sarcoma"
+
+# Stromal and fibroblast-like populations
+manual_cluster_labels[c("0", "12")] <- "Fibroblasts"
+manual_cluster_labels["11"] <- "ECM_remodelling_fibroblasts"
+manual_cluster_labels["18"] <- "Perivascular_fibroblasts"
+manual_cluster_labels["21"] <- "Cancer_associated_fibroblasts"
+
+# Immune populations
+manual_cluster_labels["1"] <- "M2_macrophages"
+manual_cluster_labels["5"] <- "T_cells"
+manual_cluster_labels["13"] <- "Macrophages"
+
+# Endothelial and perivascular populations
+manual_cluster_labels["2"] <- "Endothelial_cells"
+manual_cluster_labels["6"] <- "Arterial_endothelial_cells"
+manual_cluster_labels["8"] <- "Smooth_muscle_cells"
+
+# Adipocyte/adipogenic populations
+manual_cluster_labels["9"] <- "Adipogenic_like_fibroblasts"
+
+# Keep weak or mixed clusters unresolved.
+manual_cluster_labels[c("4", "7", "15", "16", "17", "19", "22")] <- "Unresolved"
+
+# Record confidence separately so provisional calls are not treated equally
+manual_annotation_confidence <- setNames(
+  rep("High", length(cluster_ids)),
+  cluster_ids
+)
+
+manual_annotation_confidence[
+  c("0", "2", "8", "9", "11", "12", "18", "21")
+] <- "Moderate"
+
+manual_annotation_confidence[c("3", "10", "14", "20")] <- "Provisional"
+
+manual_annotation_confidence[c("4", "7", "15", "16", "17", "19", "22")] <- "Unresolved"
+
+allowed_labels <- c(annotation_marker_columns, "Unresolved")
+
+if (!all(manual_cluster_labels %in% allowed_labels)) {
+  stop(
+    "Manual labels must match exact marker-file column names. Invalid labels: ",
+    paste(
+      setdiff(unique(manual_cluster_labels), allowed_labels),
+      collapse = ", "
+    )
+  )
+}
+
+if (any(manual_cluster_labels == "Unresolved")) {
+  message(
+    "Clusters retained as Unresolved: ",
+    paste(
+      names(manual_cluster_labels)[
+        manual_cluster_labels == "Unresolved"
+      ],
+      collapse = ", "
+    )
+  )
+}
+
+combined$manual_annotation <- unname(
+  manual_cluster_labels[as.character(combined$seurat_clusters)]
+)
+
+manual_annotation_table <- data.frame(
+  seurat_clusters = names(manual_cluster_labels),
+  manual_annotation = unname(manual_cluster_labels),
+  confidence = unname(
+    manual_annotation_confidence[names(manual_cluster_labels)]
+  ),
+  stringsAsFactors = FALSE
+)
+
+write_csv(
+  manual_annotation_table,
+  file.path(
+    tables_annotations_dir,
+    "manual_cluster_annotation.csv"
+  )
+)
+
+# Manual annotation UMAP for direct comparison with the separate SingleR and ScType UMAPs
+p_manual_annotation <- DimPlot(
+  combined,
+  reduction = umap_reduction,
+  group.by = "manual_annotation",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.5
+) +
+  ggtitle("WDLPS and DDLPS Bulk cohort: manual annotation")
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "UMAP_manual_annotation.pdf"
+  ),
+  plot = p_manual_annotation,
+  width = 10,
+  height = 7
+)
+p_manual_annotation
+
+```
+
+
+```{r}
+#-------------------------------------------------------
+# STEP 15B: Independent SingleR annotation with HPCA
+#-------------------------------------------------------
+
+if (!exists("hpca_reference_file")) {
+  hpca_reference_file <- file.path(
+    getwd(),
+    "data",
+    "HPCA_reference.rds"
+  )
+}
+if (!exists("download_hpca_if_missing")) {
+  download_hpca_if_missing <- TRUE
+}
+
+combined$SingleR_HPCA_label <- NA_character_
+combined$SingleR_HPCA_pruned <- NA_character_
+combined$SingleR_HPCA_final <- NA_character_
+
+hpca_cluster_labels <- data.frame(
+  seurat_clusters = sort(unique(as.character(combined$seurat_clusters))),
+  SingleR_HPCA_label = NA_character_,
+  SingleR_HPCA_fraction = NA_real_
+)
+
+if (
+  !file.exists(hpca_reference_file) &&
+  download_hpca_if_missing &&
+  requireNamespace("celldex", quietly = TRUE)
+) {
+  message(
+    "HPCA reference not found; downloading it through celldex and caching: ",
+    hpca_reference_file
+  )
+  dir.create(
+    dirname(hpca_reference_file),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  hpca_download <- tryCatch(
+    celldex::HumanPrimaryCellAtlasData(),
+    error = function(e) {
+      warning("Unable to download HPCA reference: ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (!is.null(hpca_download)) {
+    saveRDS(hpca_download, hpca_reference_file)
+    rm(hpca_download)
+    gc()
+  }
+}
+
+if (file.exists(hpca_reference_file)) {
+  ref <- readRDS(hpca_reference_file)
+
+  if (!inherits(ref, "SummarizedExperiment")) {
+    stop("HPCA_reference.rds must contain a SummarizedExperiment-like object.")
+  }
+  if (!"label.main" %in% colnames(colData(ref))) {
+    stop("HPCA reference does not contain ref$label.main.")
+  }
+
+  # SingleR accepts a log-normalised gene-by-cell matrix as the test input.
+  mtx <- tryCatch(
+    GetAssayData(combined, assay = "RNA", layer = "data"),
+    error = function(e) GetAssayData(combined, assay = "RNA", slot = "data")
+  )
+
+  common_hpca_genes <- intersect(rownames(mtx), rownames(ref))
+  if (length(common_hpca_genes) < 1000) {
+    warning("Fewer than 1,000 genes overlap the query and HPCA reference.")
+  }
+
+  pred <- SingleR(
+    test = mtx[common_hpca_genes, , drop = FALSE],
+    ref = ref[common_hpca_genes, ],
+    labels = ref$label.main
+  )
+
+  pred_df <- as.data.frame(pred)
+  pred_df$cell <- rownames(pred_df)
+  pred_df$seurat_clusters <- as.character(
+    combined$seurat_clusters[match(pred_df$cell, colnames(combined))]
+  )
+  pred_df$SingleR_HPCA_final <- ifelse(
+    is.na(pred_df$pruned.labels),
+    "Uncertain",
+    pred_df$pruned.labels
+  )
+
+  pred_match <- match(colnames(combined), pred_df$cell)
+  stopifnot(!anyNA(pred_match))
+  combined$SingleR_HPCA_label <- pred_df$labels[pred_match]
+  combined$SingleR_HPCA_pruned <- pred_df$pruned.labels[pred_match]
+  combined$SingleR_HPCA_final <- pred_df$SingleR_HPCA_final[pred_match]
+
+  write_csv(
+    pred_df %>%
+      select(
+        cell,
+        seurat_clusters,
+        labels,
+        pruned.labels,
+        delta.next,
+        SingleR_HPCA_final
+      ),
+    file.path(
+      tables_annotations_dir,
+      "SingleR_HPCA_cell_predictions.csv"
+    )
+  )
+
+  hpca_cluster_labels <- pred_df %>%
+    count(seurat_clusters, SingleR_HPCA_final, name = "n_cells") %>%
+    group_by(seurat_clusters) %>%
+    mutate(SingleR_HPCA_fraction = n_cells / sum(n_cells)) %>%
+    arrange(seurat_clusters, desc(n_cells)) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    rename(SingleR_HPCA_label = SingleR_HPCA_final)
+
+  write_csv(
+    hpca_cluster_labels,
+    file.path(
+      tables_annotations_dir,
+      "SingleR_HPCA_cluster_majority_labels.csv"
+    )
+  )
+
+  p_singler_hpca <- DimPlot(
+    combined,
+    reduction = umap_reduction,
+    group.by = "SingleR_HPCA_final",
+    label = TRUE,
+    repel = TRUE,
+    pt.size = 0.5
+  ) +
+    ggtitle("WDLPS and DDLPS Bulk cohort SingleR: HPCA Reference")
+
+  ggsave(
+    filename = file.path(
+      plots_annotation_dir,
+      "UMAP_SingleR_HPCA.pdf"
+    ),
+    plot = p_singler_hpca,
+    width = 10,
+    height = 7
+  )
+
+  rm(ref, mtx, pred, pred_df)
+  gc()
+} else {
+  warning(
+    "HPCA reference not found at ",
+    hpca_reference_file,
+    ". Install celldex with BiocManager::install('celldex'), ",
+    "then rerun Step 15B. Skipping HPCA SingleR."
+  )
+}
+
+```
+
+
+```{r}
+#-------------------------------------------------------
+# STEP 16: ScType scoring using exact marker columns
+#-------------------------------------------------------
+
+# Remove incomplete scoring columns from failed runs.
+stale_score_columns <- grep(
+  "_Score[0-9]+$",
+  colnames(combined@meta.data),
+  value = TRUE
+)
+if (length(stale_score_columns) > 0) {
+  combined@meta.data <- combined@meta.data[
+    ,
+    setdiff(colnames(combined@meta.data), stale_score_columns),
+    drop = FALSE
+  ]
+  gc()
+}
+
+# ScType-style scoring uses cluster-level marker z-scores.
+log_data_sctype <- tryCatch(
+  GetAssayData(combined, assay = "RNA", layer = "data"),
+  error = function(e) GetAssayData(combined, assay = "RNA", slot = "data")
+)
+
+cluster_levels_sctype <- sort(
+  unique(as.character(combined$seurat_clusters))
+)
+cluster_index_sctype <- match(
+  as.character(combined$seurat_clusters),
+  cluster_levels_sctype
+)
+
+cluster_membership_sctype <- Matrix::sparseMatrix(
+  i = seq_len(ncol(combined)),
+  j = cluster_index_sctype,
+  x = 1,
+  dims = c(ncol(combined), length(cluster_levels_sctype)),
+  dimnames = list(colnames(combined), cluster_levels_sctype)
+)
+
+cluster_sizes_sctype <- Matrix::colSums(cluster_membership_sctype)
+cluster_sums_sctype <- log_data_sctype %*% cluster_membership_sctype
+cluster_means_sctype <- as.matrix(cluster_sums_sctype)
+cluster_means_sctype <- sweep(
+  cluster_means_sctype,
+  2,
+  cluster_sizes_sctype,
+  "/"
+)
+
+gene_centres_sctype <- rowMeans(cluster_means_sctype)
+gene_sds_sctype <- apply(cluster_means_sctype, 1, stats::sd)
+gene_sds_sctype[
+  !is.finite(gene_sds_sctype) | gene_sds_sctype == 0
+] <- 1
+
+cluster_z_sctype <- sweep(
+  cluster_means_sctype,
+  1,
+  gene_centres_sctype,
+  "-"
+)
+cluster_z_sctype <- sweep(
+  cluster_z_sctype,
+  1,
+  gene_sds_sctype,
+  "/"
+)
+cluster_z_sctype[!is.finite(cluster_z_sctype)] <- 0
+
+sctype_score_matrix <- matrix(
+  NA_real_,
+  nrow = length(marker_panel_exact_use),
+  ncol = length(cluster_levels_sctype),
+  dimnames = list(
+    names(marker_panel_exact_use),
+    cluster_levels_sctype
+  )
+)
+
+markers_used_sctype <- integer(length(marker_panel_exact_use))
+names(markers_used_sctype) <- names(marker_panel_exact_use)
+
+for (marker_col in names(marker_panel_exact_use)) {
+  genes <- intersect(
+    marker_panel_exact_use[[marker_col]],
+    rownames(cluster_z_sctype)
+  )
+  markers_used_sctype[[marker_col]] <- length(genes)
+
+  if (length(genes) >= 2) {
+    sctype_score_matrix[marker_col, ] <- colMeans(
+      cluster_z_sctype[genes, , drop = FALSE]
+    )
+  }
+}
+
+score_by_cluster_exact_long <- as.data.frame(
+  t(sctype_score_matrix),
+  check.names = FALSE
+) %>%
+  tibble::rownames_to_column("seurat_clusters") %>%
+  pivot_longer(
+    cols = -seurat_clusters,
+    names_to = "marker_column",
+    values_to = "mean_score"
+  ) %>%
+  mutate(
+    n_markers_used = unname(markers_used_sctype[marker_column])
+  ) %>%
+  filter(!is.na(mean_score))
+
+sctype_exact_cluster_labels <- score_by_cluster_exact_long %>%
+  group_by(seurat_clusters) %>%
+  arrange(desc(mean_score), .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  rename(
+    ScType_exact_marker_column = marker_column,
+    ScType_exact_score = mean_score
+  )
+
+write_csv(
+  score_by_cluster_exact_long,
+  file.path(
+    tables_annotations_dir,
+    "ScType_style_exact_marker_column_scores_long.csv"
+  )
+)
+
+write_csv(
+  sctype_exact_cluster_labels,
+  file.path(
+    tables_annotations_dir,
+    "ScType_style_exact_marker_column_cluster_labels.csv"
+  )
+)
+
+sctype_exact_label_map <- setNames(
+  sctype_exact_cluster_labels$ScType_exact_marker_column,
+  sctype_exact_cluster_labels$seurat_clusters
+)
+
+combined$ScType_exact_marker_column <- unname(
+  sctype_exact_label_map[as.character(combined$seurat_clusters)]
+)
+
+rm(
+  log_data_sctype,
+  cluster_membership_sctype,
+  cluster_sums_sctype,
+  cluster_means_sctype,
+  cluster_z_sctype,
+  gene_centres_sctype,
+  gene_sds_sctype,
+  sctype_score_matrix
+)
+gc()
+
+p_sctype_exact <- DimPlot(
+  combined,
+  reduction = umap_reduction,
+  group.by = "ScType_exact_marker_column",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.5
+) +
+  ggtitle("WDLPS and DDLPS Bulk ScType: Marker-Based Annotation")
+
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "UMAP_ScType_exact_marker_columns.pdf"
+  ),
+  plot = p_sctype_exact,
+  width = 10,
+  height = 7
+)
+
+# Save annotation methods checkpoint.
+saveRDS(
+  combined,
+  file.path(
+    objects_final_dir,
+    "GSE324208_after_HPCA_ScType_annotation.rds"
+  )
+)
+
+
+```
+
+
+```{r}
+#-----------------------------------------------------------
+# STEP 17: Compare manual annotation, SingleR, and ScType
+#-----------------------------------------------------------
+
+multi_method_annotation_comparison <- manual_annotation_table %>%
+  mutate(seurat_clusters = as.character(seurat_clusters)) %>%
+  left_join(
+    hpca_cluster_labels %>%
+      mutate(seurat_clusters = as.character(seurat_clusters)) %>%
+      select(
+        seurat_clusters,
+        SingleR_HPCA_label,
+        SingleR_HPCA_fraction
+      ),
+    by = "seurat_clusters"
+  ) %>%
+  left_join(
+    sctype_exact_cluster_labels %>%
+      mutate(seurat_clusters = as.character(seurat_clusters)) %>%
+      select(
+        seurat_clusters,
+        ScType_exact_marker_column,
+        ScType_exact_score
+      ),
+    by = "seurat_clusters"
+  )
+
+write_csv(
+  multi_method_annotation_comparison,
+  file.path(
+    tables_annotations_dir,
+    "manual_vs_SingleR_vs_ScType_cluster_comparison.csv"
+  )
+)
+
+multi_method_annotation_comparison
+
+
+```
+
+```{r}
+#------------------------------------------------
+# STEP 17B: Pairwise annotation Sankey plots
+#------------------------------------------------
+
+# Compare Manual -> SingleR and Manual -> ScType
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(ggalluvial)
+library(readr)
+
+# One comparison record per Seurat cluster
+cluster_sizes_for_comparison <- combined@meta.data %>%
+  transmute(
+    seurat_clusters = as.character(seurat_clusters)
+  ) %>%
+  count(seurat_clusters, name = "n_cells")
+
+cluster_annotation_comparison_plot <- cluster_sizes_for_comparison %>%
+  left_join(
+    manual_annotation_table %>%
+      transmute(
+        seurat_clusters = as.character(seurat_clusters),
+        Manual_annotation = as.character(manual_annotation)
+      ),
+    by = "seurat_clusters"
+  ) %>%
+  left_join(
+    hpca_cluster_labels %>%
+      transmute(
+        seurat_clusters = as.character(seurat_clusters),
+        SingleR_annotation = as.character(SingleR_HPCA_label)
+      ),
+    by = "seurat_clusters"
+  ) %>%
+  left_join(
+    sctype_exact_cluster_labels %>%
+      transmute(
+        seurat_clusters = as.character(seurat_clusters),
+        ScType_annotation = as.character(ScType_exact_marker_column)
+      ),
+    by = "seurat_clusters"
+  ) %>%
+  mutate(
+    Manual_annotation = ifelse(
+      is.na(Manual_annotation) | Manual_annotation == "",
+      "Unresolved",
+      Manual_annotation
+    ),
+    SingleR_annotation = ifelse(
+      is.na(SingleR_annotation) | SingleR_annotation == "",
+      "Unavailable",
+      SingleR_annotation
+    ),
+    ScType_annotation = ifelse(
+      is.na(ScType_annotation) | ScType_annotation == "",
+      "Unresolved",
+      ScType_annotation
+    ),
+    Manual_annotation_plot = str_wrap(
+      str_replace_all(Manual_annotation, "_", " "),
+      width = 22
+    ),
+    SingleR_annotation_plot = str_wrap(
+      str_replace_all(SingleR_annotation, "_", " "),
+      width = 22
+    ),
+    ScType_annotation_plot = str_wrap(
+      str_replace_all(ScType_annotation, "_", " "),
+      width = 22
+    )
+  )
+write_csv(
+  cluster_annotation_comparison_plot,
+  file.path(
+    tables_annotations_dir,
+    "cluster_level_annotation_comparison_for_pairwise_sankey.csv"
+  )
+)
+manual_singler_flow <- cluster_annotation_comparison_plot %>%
+  group_by(
+    Manual_annotation_plot,
+    SingleR_annotation_plot
+  ) %>%
+  summarise(n_cells = sum(n_cells), .groups = "drop")
+
+manual_sctype_flow <- cluster_annotation_comparison_plot %>%
+  group_by(
+    Manual_annotation_plot,
+    ScType_annotation_plot
+  ) %>%
+ summarise(n_cells = sum(n_cells), .groups = "drop")
+
+write_csv(
+  manual_singler_flow,
+  file.path(
+    tables_annotations_dir,
+    "manual_vs_SingleR_cluster_level_sankey_counts.csv" 
+  )
+)
+
+write_csv(
+  manual_sctype_flow,
+  file.path(
+    tables_annotations_dir,
+    "manual_vs_ScType_cluster_level_sankey_counts.csv"
+  )
+)
+
+make_pairwise_sankey <- function(
+  flow_data,
+  right_column,
+  right_axis_title,
+  plot_title
+) {
+  manual_order <- flow_data %>%
+    group_by(Manual_annotation_plot) %>%
+    summarise(total = sum(n_cells), .groups = "drop") %>%
+    arrange(desc(total)) %>%
+    pull(Manual_annotation_plot)
+  
+  right_order <- flow_data %>%
+    group_by(.data[[right_column]]) %>%
+    summarise(total = sum(n_cells), .groups = "drop") %>%
+    arrange(desc(total))
+  right_order <- right_order[[right_column]]
+  
+  flow_data$Manual_annotation_plot <- factor(
+    flow_data$Manual_annotation_plot,
+    levels = manual_order
+  )
+  flow_data[[right_column]] <- factor(
+    flow_data[[right_column]],
+    levels = right_order
+  )
+ggplot(
+    flow_data,
+    aes(
+      axis1 = Manual_annotation_plot,
+      axis2 = .data[[right_column]],
+      y = n_cells
+    )
+  ) +
+ geom_alluvium(
+      aes(fill = Manual_annotation_plot),
+      width = 0.18,
+      alpha = 0.6,
+      knot.pos = 0.45
+    ) +
+    geom_stratum(
+      width = 0.22,
+      fill = "white",
+      colour = "grey35",
+      linewidth = 0.3
+    ) +
+    geom_text(
+      stat = "stratum",
+      aes(label = after_stat(stratum)),
+      size = 2.7,
+      lineheight = 0.9
+    ) +
+    scale_x_discrete(
+      limits = c("Manual", right_axis_title),
+      expand = c(0.14, 0.14)
+    ) +
+    labs(
+      title = plot_title,
+      x = NULL,
+      y = "Number of cells"
+    ) +
+    guides(fill = "none") +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+
+p_manual_singler_sankey <- make_pairwise_sankey(
+  manual_singler_flow,
+  right_column = "SingleR_annotation_plot",
+  right_axis_title = "SingleR",
+  plot_title = "Manual vs SingleR"
+)
+
+p_manual_sctype_sankey <- make_pairwise_sankey(
+  manual_sctype_flow,
+  right_column = "ScType_annotation_plot",
+  right_axis_title = "ScType",
+  plot_title = "Manual vs ScType"
+)
+
+p_pairwise_annotation_sankey <- (
+  p_manual_singler_sankey | p_manual_sctype_sankey
+) +
+  plot_annotation(
+    title = "Pairwise annotation comparison: Bulk cohort",
+    subtitle = paste(
+      "One flow per cluster label pair; widths are weighted by cluster cell",
+      "counts."
+    )
+  )
+
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "Sankey_pairwise_manual_vs_SingleR_and_ScType.pdf"
+  ),
+  plot = p_pairwise_annotation_sankey,
+  width = 18,
+  height = 9
+)
+
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "Sankey_manual_vs_SingleR_cluster_level.pdf"
+  ),
+  plot = p_manual_singler_sankey,
+  width = 10,
+  height = 8
+)
+ggsave(
+  filename = file.path(
+    plots_annotation_dir,
+    "Sankey_manual_vs_ScType_cluster_level.pdf"
+  ),
+  plot = p_manual_sctype_sankey,
+  width = 10,
+  height = 8
+)
+p_pairwise_annotation_sankey
+
+```
+
+```{r}
+#-------------------------------------------------------------------
+# STEP 18: Manually annotated cell-state proportions by condition
+#-------------------------------------------------------------------
+
+sample_keys <- combined@meta.data %>%
+  distinct(sample_id, condition, patient_id)
+
+annotation_levels <- sort(
+  unique(as.character(combined$manual_annotation))
+)
+
+#  Add zero-count sample/state combinations before proportions
+cell_state_props <- combined@meta.data %>%
+  count(sample_id, condition, manual_annotation, name = "n_cells") %>%
+  left_join(sample_keys, by = c("sample_id", "condition")) %>%
+  complete(
+    nesting(sample_id, condition, patient_id),
+    manual_annotation = annotation_levels,
+    fill = list(n_cells = 0)
+  ) %>%
+  group_by(sample_id) %>%
+  mutate(prop = n_cells / sum(n_cells)) %>%
+  ungroup()
+
+write_csv(
+  cell_state_props,
+  file.path(
+    tables_annotations_dir,
+    "cell_state_proportions_by_sample.csv"
+  )
+)
+
+# Paired patient-level test; cells are not treated as replicates.
+paired_state_props <- cell_state_props %>%
+  group_by(
+    patient_id,
+    condition,
+    manual_annotation
+  ) %>%
+  summarise(prop = mean(prop), .groups = "drop") %>%
+  pivot_wider(names_from = condition, values_from = prop) %>%
+  filter(!is.na(WDLPS), !is.na(DDLPS))
+
+paired_state_tests <- paired_state_props %>%
+  group_by(manual_annotation) %>%
+  summarise(
+    n_pairs = n(),
+    median_WDLPS = median(WDLPS),
+    median_DDLPS = median(DDLPS),
+    median_DDLPS_minus_WDLPS = median(DDLPS - WDLPS),
+    p_value = if (
+      n() >= 3 &&
+      any(abs(DDLPS - WDLPS) > .Machine$double.eps)
+    ) {
+      wilcox.test(
+        DDLPS,
+        WDLPS,
+        paired = TRUE,
+        exact = FALSE
+      )$p.value
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH"))
+
+write_csv(
+  paired_state_tests,
+  file.path(
+    tables_annotations_dir,
+    "paired_cell_state_proportion_tests.csv"
+  )
+)
+
+p_state_props <- ggplot(
+  cell_state_props,
+  aes(x = condition, y = prop, fill = condition)
+) +
+  geom_line(
+    aes(group = patient_id),
+    colour = "grey70",
+    alpha = 0.5,
+    linewidth = 0.3
+  ) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1) +
+  facet_wrap(~ manual_annotation, scales = "free_y") +
+  labs(
+    title = "Manual cell annotations in WDLPS and DDLPS Bulk cohort",
+    subtitle = "Each point is one sample; grey lines connect matched patients",
+    x = "Condition",
+    y = "Proportion per sample"
+  )
+
+ggsave(
+  filename = file.path(
+    plots_final_dir,
+    "Manual_annotation_proportions_WDLPS_vs_DDLPS.pdf"
+  ),
+  plot = p_state_props,
+  width = 14,
+  height = 9
+)
+
+```
+
+```{r}
+#-----------------------------------------------------
+# STEP 19: Save final object and session information
+#-----------------------------------------------------
+
+saveRDS(
+  combined,
+  file.path(
+    objects_final_dir,
+    "GSE324208_manual_SingleR_ScType_compared_object.rds"
+  )
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(tables_metadata_dir, "sessionInfo.txt")
+)
+
+cat("Workflow completed successfully.\n")
+
+```
+
+
+

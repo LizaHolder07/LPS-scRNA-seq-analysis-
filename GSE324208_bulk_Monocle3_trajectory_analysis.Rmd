@@ -1,0 +1,1256 @@
+---
+title: "GSE324208 RNA-only scRNA-seq bulk Monocle3 trajectory analysis"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r install-packages, eval=FALSE}
+#------------------------------------
+# STEP 0: Install packages
+#------------------------------------
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+cran_packages <- c(
+  "Seurat",
+  "SeuratObject",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "purrr",
+  "readr",
+  "ggplot2",
+  "patchwork",
+  "future",
+  "remotes",
+  "devtools"
+)
+
+bioconductor_packages <- c(
+  "BiocGenerics",
+  "DelayedArray",
+  "DelayedMatrixStats",
+  "limma",
+  "lme4",
+  "batchelor",
+  "SingleCellExperiment",
+  "SummarizedExperiment",
+  "S4Vectors",
+  "ggrastr"
+)
+
+install.packages(cran_packages)
+install.packages("BiocManager")
+
+BiocManager::install(
+  bioconductor_packages,
+  ask = FALSE,
+  update = FALSE
+)
+
+# Monocle3 1.0.0 depends on two older CRAN packages. Install archived dependencies before Monocle3.
+remotes::install_version(
+  "grr",
+  version = "0.9.5",
+  repos = "https://cran.r-project.org",
+  upgrade = "never"
+)
+
+remotes::install_version(
+  "Matrix.utils",
+  version = "0.9.8",
+  repos = "https://cran.r-project.org",
+  upgrade = "never"
+)
+
+# Monocle3 1.0.0 is the BEAR-compatible trajectory version used
+remotes::install_github(
+  "cole-trapnell-lab/monocle3",
+  ref = "1.0.0",
+  upgrade = "never"
+)
+
+library(monocle3)
+
+```
+
+```{r}
+#-----------------------------------------------
+# STEP 1: Clear environment and set parameters
+#-----------------------------------------------
+
+rm(list = ls())
+gc()
+
+# Paths and output names
+project_name <- "GSE324208_scRNA_bulk_trajectory_analysis"
+working_dir <- "/rds/projects/g/gendood-bioinfohub/Thesis_LH"
+
+# Input from bulk Seurat workflow.
+seurat_analysis_dir <- "GSE324208_scRNA_bulk_analysis"
+
+# Trajectory output folder.
+out_dir <- project_name
+
+# Restrict to tumour/stromal/adipogenic states. Thus immune and endothelial lineages do not distort the trajectory
+trajectory_labels <- c(
+  "LPS_tumour_cells",
+  "Sarcoma",
+  "Adipogenic_like_fibroblasts",
+  "Adipocytes",
+  "Cancer_associated_fibroblasts",
+  "Fibroblasts",
+  "ECM_remodelling_fibroblasts",
+  "Perivascular_fibroblasts",
+  "Smooth_muscle_cells"
+)
+
+# Rooting starts from adipogenic/fibroblast-like states and tests progression towards tumour-like/proliferative states.
+root_state_priority <- c(
+  "Adipogenic_like_fibroblasts",
+  "Adipocytes",
+  "Fibroblasts",
+  "Cancer_associated_fibroblasts",
+  "ECM_remodelling_fibroblasts"
+)
+
+# All trajectory cells are retained. 
+use_all_selected_trajectory_cells <- TRUE
+minimum_cells_per_state <- 50L
+maximum_root_cells <- 200L
+monocle_num_dim <- 30L
+trajectory_hvgs <- 1000L
+graph_test_cores <- 1L
+trajectory_marker_q_threshold <- 0.05
+
+# Keep graph_test below 10,000 cells to avoid the Monocle3 principal_graph rbind error
+graph_test_max_cells <- 9999L
+
+# Use Seurat Harmony UMAP when present.
+use_existing_seurat_umap <- TRUE
+
+# FALSE learns one graph across selected cells. Set TRUE if the selected cells are visibly disconnected and should not be forced into one trajectory.
+learn_graph_use_partition <- FALSE
+
+# If graph test is slow, set to FALSE
+run_graph_test <- TRUE
+
+# Set seed for reproducibility
+set.seed(42)
+
+```
+
+
+```{r}
+#------------------------------------
+# STEP 2: Load required libraries
+#------------------------------------
+
+required_packages <- c(
+  "Seurat",
+  "SeuratObject",
+  "monocle3",
+  "SingleCellExperiment",
+  "SummarizedExperiment",
+  "S4Vectors",
+  "Matrix",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "purrr",
+  "readr",
+  "ggplot2",
+  "patchwork",
+  "future"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install these packages before running the trajectory workflow."
+  )
+}
+
+library(Seurat)
+library(SeuratObject)
+library(monocle3)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(S4Vectors)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(ggplot2)
+library(patchwork)
+library(future)
+
+theme_set(theme_classic(base_size = 12))
+
+```
+
+
+```{r}
+#---------------------------
+# STEP 3: Set up folders
+#---------------------------
+
+setwd(path.expand(working_dir))
+
+seurat_out_dir <- file.path(path.expand(working_dir), seurat_analysis_dir)
+trajectory_out_dir <- file.path(path.expand(working_dir), out_dir)
+
+objects_dir <- file.path(trajectory_out_dir, "objects")
+plots_dir <- file.path(trajectory_out_dir, "plots")
+tables_dir <- file.path(trajectory_out_dir, "tables")
+
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+
+seurat_objects_final_dir <- file.path(
+  seurat_out_dir,
+  "objects",
+  "04_final"
+)
+
+seurat_objects_integrated_dir <- file.path(
+  seurat_out_dir,
+  "objects",
+  "03_integrated"
+)
+
+cat("Trajectory output folder:", trajectory_out_dir, "\n")
+cat("Objects folder:", objects_dir, "\n")
+cat("Plots folder:", plots_dir, "\n")
+cat("Tables folder:", tables_dir, "\n")
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 4: Load the annotated bulk Seurat object
+#-----------------------------------------------
+
+object_candidates <- c(
+  file.path(
+    seurat_objects_final_dir,
+    "GSE324208_manual_SingleR_ScType_compared_object.rds"
+  ),
+  file.path(
+    seurat_objects_final_dir,
+    "GSE324208_after_HPCA_ScType_annotation.rds"
+  ),
+  file.path(
+    seurat_objects_integrated_dir,
+    "GSE324208_selected_clustered_object.rds"
+  )
+)
+
+input_object_file <- object_candidates[file.exists(object_candidates)][1]
+
+if (is.na(input_object_file)) {
+  stop(
+    "No annotated Seurat object was found. Expected one of:\n",
+    paste(object_candidates, collapse = "\n")
+  )
+}
+
+seurat_full <- readRDS(input_object_file)
+DefaultAssay(seurat_full) <- "RNA"
+
+annotation_candidates <- c(
+  "manual_annotation",
+  "final_exact_marker_annotation",
+  "ScType_exact_marker_column",
+  "SingleR_HPCA_label",
+  "SingleR_exact_marker_column"
+)
+
+annotation_column <- annotation_candidates[
+  annotation_candidates %in% colnames(seurat_full[[]])
+][1]
+
+if (is.na(annotation_column)) {
+  stop(
+    "No supported annotation column was found. Expected one of: ",
+    paste(annotation_candidates, collapse = ", ")
+  )
+}
+
+if (!"sample_id" %in% colnames(seurat_full[[]])) {
+  seurat_full$sample_id <- as.character(seurat_full$orig.ident)
+}
+
+if (!"condition" %in% colnames(seurat_full[[]])) {
+  stop("The Seurat object does not contain a condition column.")
+}
+
+cat("Input object:", input_object_file, "\n")
+cat("Cells:", ncol(seurat_full), "\n")
+cat("Genes:", nrow(seurat_full), "\n")
+cat("Annotation column:", annotation_column, "\n")
+
+print(sort(table(seurat_full[[annotation_column]][, 1]), decreasing = TRUE))
+
+```
+
+
+```{r}
+#------------------------------------
+# STEP 5: Select trajectory cells
+#------------------------------------
+
+available_labels <- sort(
+  unique(as.character(seurat_full[[annotation_column]][, 1]))
+)
+
+trajectory_labels_present <- intersect(
+  trajectory_labels,
+  available_labels
+)
+
+if (length(trajectory_labels_present) < 2) {
+  stop(
+    "Fewer than two requested trajectory labels are present. Present labels: ",
+    paste(trajectory_labels_present, collapse = ", "),
+    ". Edit trajectory_labels before continuing."
+  )
+}
+
+trajectory_metadata <- seurat_full[[]] %>%
+  select(-any_of("cell")) %>%
+  tibble::rownames_to_column("cell") %>%
+  mutate(
+    trajectory_state = as.character(.data[[annotation_column]]),
+    sample_id = as.character(sample_id),
+    condition = as.character(condition)
+  ) %>%
+  filter(trajectory_state %in% trajectory_labels_present)
+
+state_counts_before <- trajectory_metadata %>%
+  count(condition, trajectory_state, name = "n_cells") %>%
+  arrange(condition, desc(n_cells))
+
+state_counts_total <- trajectory_metadata %>%
+  count(trajectory_state, name = "n_cells") %>%
+  arrange(desc(n_cells))
+
+if (any(state_counts_total$n_cells < minimum_cells_per_state)) {
+  warning(
+    "One or more selected trajectory states contains fewer than ",
+    minimum_cells_per_state,
+    " cells. Interpret small states cautiously."
+  )
+}
+
+trajectory_cells <- trajectory_metadata$cell
+
+lineage_seurat <- subset(
+  seurat_full,
+  cells = trajectory_cells
+)
+
+lineage_seurat$trajectory_state <- as.character(
+  lineage_seurat[[annotation_column]][, 1]
+)
+
+trajectory_sampling_table <- lineage_seurat[[]] %>%
+  select(-any_of("cell")) %>%
+  tibble::rownames_to_column("cell") %>%
+  count(
+    condition,
+    sample_id,
+    trajectory_state,
+    name = "n_cells"
+  ) %>%
+  arrange(condition, sample_id, trajectory_state)
+
+write_csv(
+  state_counts_before,
+  file.path(tables_dir, "Monocle3_selected_state_counts.csv")
+)
+
+write_csv(
+  trajectory_sampling_table,
+  file.path(tables_dir, "Monocle3_cells_retained_by_sample_and_state.csv")
+)
+
+cat(
+  "Trajectory labels present:",
+  paste(trajectory_labels_present, collapse = ", "),
+  "\n"
+)
+cat("Trajectory cells retained:", ncol(lineage_seurat), "\n")
+
+print(sort(table(lineage_seurat$trajectory_state), decreasing = TRUE))
+
+rm(seurat_full, trajectory_metadata)
+if (exists("trajectory_strata")) {
+  rm(trajectory_strata)
+}
+gc()
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 6: Overview on the existing Seurat UMAP
+#-----------------------------------------------
+
+seurat_umap <- if ("umap.harmony" %in% Reductions(lineage_seurat)) {
+  "umap.harmony"
+} else if ("umap" %in% Reductions(lineage_seurat)) {
+  "umap"
+} else {
+  NA_character_
+}
+
+if (!is.na(seurat_umap)) {
+  p_selected_state <- DimPlot(
+    lineage_seurat,
+    reduction = seurat_umap,
+    group.by = "trajectory_state",
+    label = TRUE,
+    repel = TRUE,
+    pt.size = 0.6
+  ) +
+    ggtitle("Selected bulk trajectory states")
+
+  p_selected_condition <- DimPlot(
+    lineage_seurat,
+    reduction = seurat_umap,
+    group.by = "condition",
+    pt.size = 0.6
+  ) +
+    ggtitle("WDLPS and DDLPS cells in selected states")
+
+  p_selected_cluster <- DimPlot(
+    lineage_seurat,
+    reduction = seurat_umap,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 0.6
+  ) +
+    ggtitle("Seurat clusters in selected states")
+
+  ggsave(
+    filename = file.path(
+      plots_dir,
+      "Monocle3_01_selected_bulk_trajectory_overview.pdf"
+    ),
+    plot = (p_selected_state | p_selected_condition) / p_selected_cluster,
+    width = 15,
+    height = 11
+  )
+}
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 7: Construct a Monocle 3 cell_data_set
+#-----------------------------------------------
+
+counts_matrix <- tryCatch(
+  GetAssayData(lineage_seurat, assay = "RNA", layer = "counts"),
+  error = function(e) {
+    GetAssayData(lineage_seurat, assay = "RNA", slot = "counts")
+  }
+)
+
+cell_metadata <- lineage_seurat[[]]
+
+gene_metadata <- data.frame(
+  gene_short_name = rownames(counts_matrix),
+  row.names = rownames(counts_matrix),
+  stringsAsFactors = FALSE
+)
+
+cds <- monocle3::new_cell_data_set(
+  expression_data = counts_matrix,
+  cell_metadata = cell_metadata,
+  gene_metadata = gene_metadata
+)
+
+cds <- monocle3::detect_genes(cds, min_expr = 0.1)
+
+minimum_gene_cells <- max(10L, ceiling(0.01 * ncol(cds)))
+genes_detected <- rowData(cds)$num_cells_expressed >= minimum_gene_cells
+genes_detected[is.na(genes_detected)] <- FALSE
+cds <- cds[genes_detected, ]
+
+cat("Monocle CDS cells:", ncol(cds), "\n")
+cat("Monocle CDS genes retained:", nrow(cds), "\n")
+
+rm(counts_matrix, cell_metadata, gene_metadata)
+gc()
+
+```
+
+
+```{r}
+#-----------------------------------------------------
+# STEP 8: Preprocess, reduce dimensions and cluster
+#-----------------------------------------------------
+
+num_dim_use <- min(
+  monocle_num_dim,
+  ncol(cds) - 1L,
+  nrow(cds) - 1L
+)
+
+if (num_dim_use < 2L) {
+  stop("Too few cells or genes are available for Monocle PCA.")
+}
+
+cds <- monocle3::preprocess_cds(
+  cds,
+  method = "PCA",
+  num_dim = num_dim_use,
+  norm_method = "log",
+  verbose = FALSE
+)
+
+if (use_existing_seurat_umap && !is.na(seurat_umap)) {
+  seurat_umap_coordinates <- Embeddings(
+    lineage_seurat,
+    reduction = seurat_umap
+  )
+
+  seurat_umap_coordinates <- seurat_umap_coordinates[
+    colnames(cds),
+    1:2,
+    drop = FALSE
+  ]
+
+  colnames(seurat_umap_coordinates) <- c("UMAP_1", "UMAP_2")
+  reducedDims(cds)$UMAP <- seurat_umap_coordinates
+} else {
+  cds <- monocle3::reduce_dimension(
+    cds,
+    reduction_method = "UMAP",
+    preprocess_method = "PCA",
+    umap.metric = "cosine",
+    verbose = FALSE
+  )
+}
+
+monocle_k <- min(20L, ncol(cds) - 1L)
+
+cds <- monocle3::cluster_cells(
+  cds,
+  reduction_method = "UMAP",
+  k = monocle_k,
+  verbose = FALSE
+)
+
+cat("Monocle clusters:", length(unique(monocle3::clusters(cds))), "\n")
+cat("Monocle partitions:", length(unique(monocle3::partitions(cds))), "\n")
+
+```
+
+
+```{r}
+#--------------------------------------
+# STEP 9: Learn the principal graph
+#--------------------------------------
+
+graph_ncenter <- min(
+  ncol(cds),
+  300L,
+  max(30L, floor(ncol(cds) / 10L))
+)
+
+cds <- monocle3::learn_graph(
+  cds,
+  use_partition = learn_graph_use_partition,
+  close_loop = FALSE,
+  learn_graph_control = list(
+    ncenter = graph_ncenter
+  ),
+  verbose = FALSE
+)
+
+partition_vector <- monocle3::partitions(cds)
+names(partition_vector) <- colnames(cds)
+
+partition_state_table <- data.frame(
+  cell = colnames(cds),
+  partition = as.character(partition_vector),
+  trajectory_state = as.character(colData(cds)$trajectory_state),
+  condition = as.character(colData(cds)$condition),
+  stringsAsFactors = FALSE
+) %>%
+  count(partition, condition, trajectory_state, name = "n_cells") %>%
+  arrange(partition, condition, trajectory_state)
+
+write_csv(
+  partition_state_table,
+  file.path(tables_dir, "Monocle3_partition_state_counts.csv")
+)
+
+```
+
+
+```{r}
+#-------------------------------------------
+# STEP 10: Select a root and order cells
+#-------------------------------------------
+
+root_state <- root_state_priority[
+  root_state_priority %in% unique(colData(cds)$trajectory_state)
+][1]
+
+if (is.na(root_state)) {
+  stop(
+    "None of the configured root states is present. Edit root_state_priority."
+  )
+}
+
+root_pool <- colnames(cds)[
+  as.character(colData(cds)$trajectory_state) == root_state
+]
+
+if (learn_graph_use_partition) {
+  root_partition <- names(
+    sort(
+      table(as.character(partition_vector[root_pool])),
+      decreasing = TRUE
+    )
+  )[1]
+
+  root_pool <- root_pool[
+    as.character(partition_vector[root_pool]) == root_partition
+  ]
+} else {
+  root_partition <- "single_graph"
+}
+
+if (length(root_pool) == 0) {
+  stop("No root cells were available after root-state filtering.")
+}
+
+set.seed(42)
+root_cells <- sample(
+  root_pool,
+  size = min(maximum_root_cells, length(root_pool)),
+  replace = FALSE
+)
+
+cds <- monocle3::order_cells(
+  cds,
+  reduction_method = "UMAP",
+  root_cells = root_cells,
+  verbose = FALSE
+)
+
+pseudotime_vector <- monocle3::pseudotime(cds)
+pseudotime_vector[!is.finite(pseudotime_vector)] <- NA_real_
+
+root_summary <- data.frame(
+  root_state = root_state,
+  root_partition = root_partition,
+  n_root_cells = length(root_cells),
+  n_ordered_cells = sum(!is.na(pseudotime_vector)),
+  n_unordered_cells = sum(is.na(pseudotime_vector)),
+  stringsAsFactors = FALSE
+)
+
+write_csv(
+  root_summary,
+  file.path(tables_dir, "Monocle3_root_selection_summary.csv")
+)
+
+print(root_summary)
+
+```
+
+
+```{r}
+#-----------------------------------------------
+# STEP 11: Plot trajectory and pseudotime
+#-----------------------------------------------
+
+umap_coordinates <- as.data.frame(reducedDims(cds)$UMAP[, 1:2])
+colnames(umap_coordinates) <- c("UMAP_1", "UMAP_2")
+umap_coordinates$cell <- rownames(umap_coordinates)
+
+cell_metadata_for_plot <- as.data.frame(colData(cds)) %>%
+  select(any_of(c("trajectory_state", "condition", "sample_id"))) %>%
+  tibble::rownames_to_column("cell")
+
+trajectory_plot_data <- umap_coordinates %>%
+  left_join(cell_metadata_for_plot, by = "cell") %>%
+  mutate(monocle3_pseudotime = unname(pseudotime_vector[cell]))
+
+principal_graph_object <- monocle3::principal_graph(cds)[["UMAP"]]
+principal_graph_coordinates <- cds@principal_graph_aux[["UMAP"]]$dp_mst
+
+if (nrow(principal_graph_coordinates) == 2) {
+  principal_graph_nodes <- as.data.frame(t(principal_graph_coordinates))
+} else {
+  principal_graph_nodes <- as.data.frame(principal_graph_coordinates[, 1:2])
+}
+
+principal_graph_nodes <- principal_graph_nodes[, 1:2]
+colnames(principal_graph_nodes) <- c("UMAP_1", "UMAP_2")
+principal_graph_nodes <- principal_graph_nodes %>%
+  tibble::rownames_to_column("node")
+
+principal_graph_edges <- igraph::as_data_frame(
+  principal_graph_object,
+  what = "edges"
+) %>%
+  select(from, to) %>%
+  left_join(principal_graph_nodes, by = c("from" = "node")) %>%
+  rename(x = UMAP_1, y = UMAP_2) %>%
+  left_join(principal_graph_nodes, by = c("to" = "node")) %>%
+  rename(xend = UMAP_1, yend = UMAP_2)
+
+root_pr_nodes <- cds@principal_graph_aux[["UMAP"]]$root_pr_nodes
+
+principal_graph_node_labels <- principal_graph_nodes %>%
+  mutate(
+    node_degree = as.numeric(igraph::degree(principal_graph_object)[node]),
+    node_label = case_when(
+      node %in% root_pr_nodes ~ paste0("root\n", node),
+      node_degree > 2 ~ paste0("branch\n", node),
+      node_degree == 1 ~ paste0("leaf\n", node),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(node_label))
+
+p_trajectory_state <- ggplot(
+  trajectory_plot_data,
+  aes(x = UMAP_1, y = UMAP_2)
+) +
+  geom_segment(
+    data = principal_graph_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    inherit.aes = FALSE,
+    colour = "grey30",
+    linewidth = 0.7
+  ) +
+  geom_point(aes(colour = trajectory_state), size = 0.6, alpha = 0.8) +
+  labs(
+    title = paste("Monocle 3 bulk trajectory rooted in", root_state),
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Cell state"
+  )
+
+p_trajectory_pseudotime <- ggplot(
+  trajectory_plot_data,
+  aes(x = UMAP_1, y = UMAP_2)
+) +
+  geom_segment(
+    data = principal_graph_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    inherit.aes = FALSE,
+    colour = "grey30",
+    linewidth = 0.7
+  ) +
+  geom_point(aes(colour = monocle3_pseudotime), size = 0.6, alpha = 0.8) +
+  scale_color_viridis_c(option = "plasma", na.value = "grey85") +
+  labs(
+    title = "Monocle 3 pseudotime",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Pseudotime"
+  )
+
+p_trajectory_condition <- ggplot(
+  trajectory_plot_data,
+  aes(x = UMAP_1, y = UMAP_2)
+) +
+  geom_segment(
+    data = principal_graph_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    inherit.aes = FALSE,
+    colour = "grey30",
+    linewidth = 0.7
+  ) +
+  geom_point(aes(colour = condition), size = 0.6, alpha = 0.8) +
+  labs(
+    title = "WDLPS and DDLPS distribution along the trajectory",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Condition"
+  )
+
+p_principal_points <- ggplot(
+  trajectory_plot_data,
+  aes(x = UMAP_1, y = UMAP_2)
+) +
+  geom_point(aes(colour = trajectory_state), size = 0.45, alpha = 0.35) +
+  geom_segment(
+    data = principal_graph_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    inherit.aes = FALSE,
+    colour = "grey20",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    data = principal_graph_nodes,
+    aes(x = UMAP_1, y = UMAP_2),
+    inherit.aes = FALSE,
+    colour = "black",
+    size = 1.5
+  ) +
+  geom_text(
+    data = principal_graph_node_labels,
+    aes(x = UMAP_1, y = UMAP_2, label = node_label),
+    inherit.aes = FALSE,
+    size = 2.7,
+    check_overlap = TRUE,
+    vjust = -0.6
+  ) +
+  labs(
+    title = "Principal graph nodes for root checking",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Cell state"
+  )
+
+ggsave(
+  filename = file.path(
+    plots_dir,
+    "Monocle3_02_trajectory_by_cell_state.pdf"
+  ),
+  plot = p_trajectory_state,
+  width = 11,
+  height = 8
+)
+
+ggsave(
+  filename = file.path(
+    plots_dir,
+    "Monocle3_03_trajectory_by_pseudotime.pdf"
+  ),
+  plot = p_trajectory_pseudotime,
+  width = 11,
+  height = 8
+)
+
+ggsave(
+  filename = file.path(
+    plots_dir,
+    "Monocle3_04_trajectory_by_condition.pdf"
+  ),
+  plot = p_trajectory_condition,
+  width = 11,
+  height = 8
+)
+
+ggsave(
+  filename = file.path(
+    plots_dir,
+    "Monocle3_05_principal_graph_nodes.pdf"
+  ),
+  plot = p_principal_points,
+  width = 11,
+  height = 8
+)
+
+```
+
+
+```{r}
+#-----------------------------------------------------
+# STEP 12: Export pseudotime and compare conditions
+#-----------------------------------------------------
+
+monocle_cluster_vector <- monocle3::clusters(cds)
+names(monocle_cluster_vector) <- colnames(cds)
+
+pseudotime_table <- as.data.frame(colData(cds)) %>%
+  select(-any_of("cell")) %>%
+  tibble::rownames_to_column("cell") %>%
+  mutate(
+    monocle3_cluster = as.character(monocle_cluster_vector[cell]),
+    monocle3_partition = as.character(partition_vector[cell]),
+    monocle3_pseudotime = unname(pseudotime_vector[cell])
+  )
+
+write_csv(
+  pseudotime_table,
+  file.path(tables_dir, "Monocle3_cell_pseudotime.csv")
+)
+
+pseudotime_by_sample <- pseudotime_table %>%
+  filter(!is.na(monocle3_pseudotime)) %>%
+  group_by(condition, sample_id) %>%
+  summarise(
+    n_cells = n(),
+    median_pseudotime = median(monocle3_pseudotime),
+    mean_pseudotime = mean(monocle3_pseudotime),
+    .groups = "drop"
+  )
+
+pseudotime_by_state_condition <- pseudotime_table %>%
+  filter(!is.na(monocle3_pseudotime)) %>%
+  group_by(condition, trajectory_state) %>%
+  summarise(
+    n_cells = n(),
+    median_pseudotime = median(monocle3_pseudotime),
+    mean_pseudotime = mean(monocle3_pseudotime),
+    .groups = "drop"
+  ) %>%
+  arrange(condition, median_pseudotime)
+
+write_csv(
+  pseudotime_by_sample,
+  file.path(tables_dir, "Monocle3_pseudotime_by_sample.csv")
+)
+
+write_csv(
+  pseudotime_by_state_condition,
+  file.path(tables_dir, "Monocle3_pseudotime_by_state_and_condition.csv")
+)
+
+# Add pseudotime results back to the seurat object 
+lineage_seurat$monocle3_pseudotime <- NA_real_
+lineage_seurat$monocle3_partition <- NA_character_
+lineage_seurat$monocle3_cluster <- NA_character_
+
+lineage_match <- match(
+  colnames(lineage_seurat),
+  pseudotime_table$cell
+)
+
+lineage_seurat$monocle3_pseudotime <- pseudotime_table$monocle3_pseudotime[
+  lineage_match
+]
+
+lineage_seurat$monocle3_partition <- pseudotime_table$monocle3_partition[
+  lineage_match
+]
+
+lineage_seurat$monocle3_cluster <- pseudotime_table$monocle3_cluster[
+  lineage_match
+]
+
+```
+
+
+```{r}
+#--------------------------------------------------
+# STEP 13: Identify trajectory-associated genes
+#--------------------------------------------------
+
+if (!file.exists(marker_file)) {
+  stop("Curated marker file was not found: ", marker_file)
+}
+
+marker_df <- read_csv(marker_file, show_col_types = FALSE)
+marker_columns <- colnames(marker_df)
+
+trajectory_marker_table <- marker_df %>%
+  select(all_of(marker_columns)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "marker_column",
+    values_to = "gene"
+  ) %>%
+  mutate(gene = str_trim(gene)) %>%
+  filter(!is.na(gene), gene != "") %>%
+  distinct(marker_column, gene) %>%
+  filter(gene %in% rownames(cds))
+
+write_csv(
+  trajectory_marker_table,
+  file.path(tables_dir, "Monocle3_curated_marker_genes_detected_in_CDS.csv")
+)
+
+cat("Curated marker categories:", length(marker_columns), "\n")
+cat("Curated marker genes detected in CDS:", n_distinct(trajectory_marker_table$gene), "\n")
+
+if (run_graph_test) {
+  # Limit graph_test to highly variable genes to keep memory bounded.
+  lineage_seurat <- FindVariableFeatures(
+    lineage_seurat,
+    assay = "RNA",
+    selection.method = "vst",
+    nfeatures = min(trajectory_hvgs, nrow(lineage_seurat)),
+    verbose = FALSE
+  )
+
+  hvg_genes_to_test <- intersect(
+    VariableFeatures(lineage_seurat),
+    rownames(cds)
+  )
+
+  curated_marker_genes_to_test <- unique(trajectory_marker_table$gene)
+
+  genes_to_test <- unique(c(
+    hvg_genes_to_test,
+    curated_marker_genes_to_test
+  ))
+
+  cat("HVGs tested:", length(hvg_genes_to_test), "\n")
+  cat("Curated marker genes added/tested:", length(curated_marker_genes_to_test), "\n")
+  cat("Total unique genes tested:", length(genes_to_test), "\n")
+
+  graph_test_cells <- colnames(cds)
+  graph_test_sampled <- FALSE
+
+  if (ncol(cds) > graph_test_max_cells) {
+    set.seed(42)
+    graph_test_cells <- sample(graph_test_cells, graph_test_max_cells)
+    graph_test_sampled <- TRUE
+  }
+
+  graph_test_cell_table <- data.frame(
+    cell = graph_test_cells,
+    graph_test_sampled = graph_test_sampled,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(
+      as.data.frame(colData(cds)) %>%
+        select(any_of(c("trajectory_state", "condition", "sample_id"))) %>%
+        tibble::rownames_to_column("cell"),
+      by = "cell"
+    )
+
+  write_csv(
+    graph_test_cell_table,
+    file.path(tables_dir, "Monocle3_graph_test_cells_used.csv")
+  )
+
+  cds_graph_test <- cds[, graph_test_cells]
+
+  cat("graph_test cells used:", ncol(cds_graph_test), "\n")
+  cat("graph_test cell sampling applied:", graph_test_sampled, "\n")
+
+  graph_test_results <- tryCatch(
+    {
+      monocle3::graph_test(
+        cds_graph_test[genes_to_test, ],
+        neighbor_graph = "principal_graph",
+        cores = graph_test_cores,
+        verbose = FALSE
+      )
+    },
+    error = function(e) {
+      writeLines(
+        c(
+          conditionMessage(e),
+          "",
+          "graph_test_neighbor_graph: principal_graph",
+          paste("graph_test_cells:", length(graph_test_cells)),
+          paste("graph_test_sampled:", graph_test_sampled),
+          paste("graph_test_genes:", length(genes_to_test))
+        ),
+        file.path(tables_dir, "Monocle3_graph_test_error.txt")
+      )
+      NULL
+    }
+  )
+
+  if (!is.null(graph_test_results)) {
+    graph_test_table <- as.data.frame(graph_test_results) %>%
+      tibble::rownames_to_column("gene") %>%
+      arrange(q_value, desc(morans_I))
+
+    if (!"status" %in% colnames(graph_test_table)) {
+      graph_test_table$status <- "OK"
+    }
+
+    significant_trajectory_genes <- graph_test_table %>%
+      filter(
+        status == "OK",
+        !is.na(q_value),
+        q_value < trajectory_marker_q_threshold,
+        morans_I > 0
+      ) %>%
+      arrange(desc(morans_I), q_value)
+
+    write_csv(
+      graph_test_table,
+      file.path(tables_dir, "Monocle3_graph_test_all_tested_genes.csv")
+    )
+
+    write_csv(
+      significant_trajectory_genes,
+      file.path(tables_dir, "Monocle3_trajectory_associated_genes.csv")
+    )
+
+    curated_marker_graph_test <- trajectory_marker_table %>%
+      inner_join(graph_test_table, by = "gene") %>%
+      mutate(
+        significant_trajectory_marker = coalesce(status == "OK", FALSE) &
+          !is.na(q_value) &
+          q_value < trajectory_marker_q_threshold &
+          !is.na(morans_I) &
+          morans_I > 0
+      ) %>%
+      arrange(marker_column, q_value, desc(morans_I), gene)
+
+    significant_curated_trajectory_markers <- curated_marker_graph_test %>%
+      filter(significant_trajectory_marker) %>%
+      arrange(desc(morans_I), q_value, marker_column, gene)
+
+    curated_marker_trajectory_summary <- curated_marker_graph_test %>%
+      group_by(marker_column) %>%
+      summarise(
+        n_markers_tested = n_distinct(gene),
+        n_significant_trajectory_markers = n_distinct(
+          gene[significant_trajectory_marker]
+        ),
+        fraction_significant = n_significant_trajectory_markers / n_markers_tested,
+        min_q_value = if (all(is.na(q_value))) {
+          NA_real_
+        } else {
+          min(q_value, na.rm = TRUE)
+        },
+        max_morans_I = if (all(is.na(morans_I))) {
+          NA_real_
+        } else {
+          max(morans_I, na.rm = TRUE)
+        },
+        significant_genes = paste(
+          unique(gene[significant_trajectory_marker]),
+          collapse = ";"
+        ),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(n_significant_trajectory_markers), min_q_value, marker_column)
+
+    write_csv(
+      curated_marker_graph_test,
+      file.path(tables_dir, "Monocle3_curated_marker_graph_test_all.csv")
+    )
+
+    write_csv(
+      significant_curated_trajectory_markers,
+      file.path(tables_dir, "Monocle3_significant_curated_trajectory_markers.csv")
+    )
+
+    write_csv(
+      curated_marker_trajectory_summary,
+      file.path(tables_dir, "Monocle3_curated_marker_trajectory_summary.csv")
+    )
+
+    cat("Genes tested:", nrow(graph_test_table), "\n")
+    cat(
+      "Significant positive-Moran's-I genes:",
+      nrow(significant_trajectory_genes),
+      "\n"
+    )
+    cat(
+      "Significant curated trajectory markers:",
+      nrow(significant_curated_trajectory_markers),
+      "\n"
+    )
+  } else {
+    message(
+      "graph_test failed. The error message was saved to ",
+      file.path(tables_dir, "Monocle3_graph_test_error.txt")
+    )
+  }
+} else {
+  message("run_graph_test is FALSE, so trajectory-associated gene testing was skipped.")
+}
+
+```
+
+
+```{r}
+#-------------------------------------
+# STEP 14: Save trajectory objects 
+#-------------------------------------
+
+saveRDS(
+  cds,
+  file.path(objects_dir, "GSE324208_bulk_Monocle3_trajectory_cds.rds")
+)
+
+saveRDS(
+  lineage_seurat,
+  file.path(
+    objects_dir,
+    "GSE324208_bulk_trajectory_cells_with_Monocle3_pseudotime.rds"
+  )
+)
+
+trajectory_parameters <- data.frame(
+  input_object = input_object_file,
+  annotation_column = annotation_column,
+  marker_file = marker_file,
+  states_requested = paste(trajectory_labels, collapse = ";"),
+  states_present = paste(trajectory_labels_present, collapse = ";"),
+  root_state = root_state,
+  root_partition = root_partition,
+  downsampled = FALSE,
+  use_all_selected_trajectory_cells = use_all_selected_trajectory_cells,
+  cells_used = ncol(cds),
+  genes_used = nrow(cds),
+  num_dim = num_dim_use,
+  graph_ncenter = graph_ncenter,
+  graph_test_genes = ifelse(
+    exists("genes_to_test"),
+    length(genes_to_test),
+    NA_integer_
+  ),
+  graph_test_max_cells = graph_test_max_cells,
+  graph_test_cells_used = if (exists("graph_test_cells")) {
+    length(graph_test_cells)
+  } else {
+    NA_integer_
+  },
+  graph_test_sampled = if (exists("graph_test_sampled")) {
+    graph_test_sampled
+  } else {
+    NA
+  },
+  trajectory_marker_q_threshold = trajectory_marker_q_threshold,
+  curated_marker_genes_detected = if (exists("trajectory_marker_table")) {
+    n_distinct(trajectory_marker_table$gene)
+  } else {
+    NA_integer_
+  },
+  significant_curated_trajectory_markers = if (
+    exists("significant_curated_trajectory_markers")
+  ) {
+    nrow(significant_curated_trajectory_markers)
+  } else {
+    NA_integer_
+  },
+  used_existing_seurat_umap = use_existing_seurat_umap &&
+    !is.na(seurat_umap),
+  learn_graph_use_partition = learn_graph_use_partition,
+  stringsAsFactors = FALSE
+)
+
+write_csv(
+  trajectory_parameters,
+  file.path(tables_dir, "Monocle3_analysis_parameters.csv")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(tables_dir, "Monocle3_sessionInfo.txt")
+)
+
+cat("Monocle 3 bulk trajectory workflow complete.\n")
+cat("Objects:", objects_dir, "\n")
+cat("Plots:", plots_dir, "\n")
+cat("Tables:", tables_dir, "\n")
+
+```
+
+
